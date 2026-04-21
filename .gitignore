@@ -1,5 +1,3 @@
-/GLM-OCR
-/GLM-OCR-ONNX
-/target
-/test.jpg
-/test.png
+GLM-OCR*
+target
+test*
