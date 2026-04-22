@@ -56,8 +56,32 @@ fn ok<T, E: std::fmt::Display>(res: std::result::Result<T, E>) -> Result<T> {
     res.map_err(|e| anyhow!(e.to_string()))
 }
 
-fn create_session_with_cuda_fallback(model_path: &Path, session_name: &str) -> Result<Session> {
+fn create_session_with_cuda_fallback(
+    model_path: &Path,
+    session_name: &str,
+    force_cpu: bool,
+) -> Result<Session> {
     let t = Instant::now();
+
+    if force_cpu {
+        let cpu_builder = ok(Session::builder())?;
+        let mut cpu_builder = ok(
+            cpu_builder.with_execution_providers([CPUExecutionProvider::default().build()]),
+        )?;
+        let session = ok(cpu_builder.commit_from_file(model_path)).with_context(|| {
+            format!(
+                "{} CPU-only initialization failed: {}",
+                session_name,
+                model_path.display()
+            )
+        })?;
+        log_info(format!(
+            "{} initialized (CPU only mode, elapsed: {:.3}s)",
+            session_name,
+            t.elapsed().as_secs_f64()
+        ));
+        return Ok(session);
+    }
 
     let cuda_ep = CUDAExecutionProvider::default();
     if !cuda_ep.supported_by_platform() {
@@ -373,20 +397,39 @@ fn pick_next_token(logits: &[f32], step: usize) -> i64 {
     pairs.first().map(|(idx, _)| *idx as i64).unwrap_or(EOS_TOKEN_IDS[0])
 }
 
-pub struct OrtBackend;
+pub struct OrtBackend {
+    force_cpu: bool,
+    quantized: bool,
+}
 
 impl OrtBackend {
-    pub fn new() -> Self {
-        Self
+    pub fn new(force_cpu: bool, quantized: bool) -> Self {
+        Self {
+            force_cpu,
+            quantized,
+        }
     }
 
-    fn model_paths(model_root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn model_paths(model_root: &Path, quantized: bool) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let onnx_dir = model_root.join("onnx");
+        let (vision_file, embed_file, decoder_file) = if quantized {
+            (
+                "vision_encoder_quantized.onnx",
+                "embed_tokens_quantized.onnx",
+                "decoder_model_merged_quantized.onnx",
+            )
+        } else {
+            (
+                "vision_encoder.onnx",
+                "embed_tokens.onnx",
+                "decoder_model_merged.onnx",
+            )
+        };
         (
             model_root.join("tokenizer.json"),
-            onnx_dir.join("vision_encoder.onnx"),
-            onnx_dir.join("embed_tokens.onnx"),
-            onnx_dir.join("decoder_model_merged.onnx"),
+            onnx_dir.join(vision_file),
+            onnx_dir.join(embed_file),
+            onnx_dir.join(decoder_file),
         )
     }
 }
@@ -406,7 +449,18 @@ impl OcrBackend for OrtBackend {
         let total_start = Instant::now();
         log_stage_start("GLM OCR ONNX Rust inference");
 
-        let (tokenizer_path, vision_path, embed_path, decoder_path) = Self::model_paths(model_root);
+        if self.force_cpu {
+            log_info("ONNX execution mode: CPU only");
+        } else {
+            log_info("ONNX execution mode: auto CUDA -> CPU fallback");
+        }
+        log_info(format!(
+            "ONNX model precision mode: {}",
+            if self.quantized { "quantized" } else { "default" }
+        ));
+
+        let (tokenizer_path, vision_path, embed_path, decoder_path) =
+            Self::model_paths(model_root, self.quantized);
 
         for p in [&tokenizer_path, &vision_path, &embed_path, &decoder_path] {
             if !p.exists() {
@@ -419,9 +473,15 @@ impl OcrBackend for OrtBackend {
         let stage_start = Instant::now();
         log_stage_start(stage);
 
-        let mut vision_session = create_session_with_cuda_fallback(&vision_path, "vision_session")?;
-        let mut embed_session = create_session_with_cuda_fallback(&embed_path, "embed_session")?;
-        let mut decoder_session = create_session_with_cuda_fallback(&decoder_path, "decoder_session")?;
+        let mut vision_session =
+            create_session_with_cuda_fallback(&vision_path, "vision_session", self.force_cpu)?;
+        let mut embed_session =
+            create_session_with_cuda_fallback(&embed_path, "embed_session", self.force_cpu)?;
+        let mut decoder_session = create_session_with_cuda_fallback(
+            &decoder_path,
+            "decoder_session",
+            self.force_cpu,
+        )?;
 
         log_stage_end(stage, stage_start);
 

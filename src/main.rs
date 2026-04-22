@@ -57,12 +57,14 @@ fn print_help(binary: &str) {
     println!("GLM OCR Rust Inference");
     println!();
     println!("Usage:");
-    println!("  {binary} [--backend <onnx|native>] [--model <path>] [--image <path>] [--verbose|--no-verbose]");
+    println!("  {binary} [--backend <onnx|native>] [--model <path>] [--image <path>] [--onnx-cpu] [--onnx-quantized] [--verbose|--no-verbose]");
     println!();
     println!("Arguments:");
     println!("  -b, --backend <name>   Select inference backend (onnx | native)");
     println!("  -m, --model <path>     Model root path");
     println!("  -i, --image <path>     Input image path");
+    println!("      --onnx-cpu         Force ONNX Runtime to use CPUExecutionProvider only");
+    println!("      --onnx-quantized   Use quantized ONNX model files (*_quantized.onnx)");
     println!("  -v, --verbose          Enable verbose logs (default)");
     println!("      --no-verbose       Disable verbose logs; stream OCR text only");
     println!("  -h, --help             Show help");
@@ -84,6 +86,14 @@ fn print_help(binary: &str) {
     println!("    1) CLI argument --verbose/--no-verbose");
     println!("    2) Environment variable OCR_VERBOSE");
     println!("    3) Default: enabled");
+    println!("  ONNX CPU mode:");
+    println!("    1) CLI argument --onnx-cpu");
+    println!("    2) Environment variable OCR_ONNX_CPU");
+    println!("    3) Default: disabled (auto CUDA->CPU fallback)");
+    println!("  ONNX quantized mode:");
+    println!("    1) CLI argument --onnx-quantized");
+    println!("    2) Environment variable OCR_ONNX_QUANTIZED");
+    println!("    3) Default: disabled (use non-quantized ONNX)");
 }
 
 fn parse_cli_options(
@@ -96,6 +106,10 @@ fn parse_cli_options(
     &'static str,
     bool,
     &'static str,
+    bool,
+    &'static str,
+    bool,
+    &'static str,
 )> {
     let mut args = std::env::args();
     let binary = args.next().unwrap_or_else(|| "glm_ocr_onnx_rust".to_string());
@@ -103,6 +117,8 @@ fn parse_cli_options(
     let mut cli_model_root: Option<String> = None;
     let mut cli_image: Option<String> = None;
     let mut cli_verbose: Option<bool> = None;
+    let mut cli_onnx_cpu: Option<bool> = None;
+    let mut cli_onnx_quantized: Option<bool> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -134,6 +150,18 @@ fn parse_cli_options(
             "--no-verbose" => {
                 cli_verbose = Some(false);
             }
+            "--onnx-cpu" => {
+                cli_onnx_cpu = Some(true);
+            }
+            "--no-onnx-cpu" => {
+                cli_onnx_cpu = Some(false);
+            }
+            "--onnx-quantized" => {
+                cli_onnx_quantized = Some(true);
+            }
+            "--no-onnx-quantized" => {
+                cli_onnx_quantized = Some(false);
+            }
             _ if arg.starts_with("--backend=") => {
                 let v = arg.trim_start_matches("--backend=").trim().to_string();
                 if v.is_empty() {
@@ -164,9 +192,30 @@ fn parse_cli_options(
                 };
                 cli_verbose = Some(enabled);
             }
+            _ if arg.starts_with("--onnx-cpu=") => {
+                let v = arg.trim_start_matches("--onnx-cpu=").trim().to_ascii_lowercase();
+                let enabled = match v.as_str() {
+                    "1" | "true" | "on" | "yes" => true,
+                    "0" | "false" | "off" | "no" => false,
+                    _ => bail!("Invalid value for --onnx-cpu={v}; use true/false"),
+                };
+                cli_onnx_cpu = Some(enabled);
+            }
+            _ if arg.starts_with("--onnx-quantized=") => {
+                let v = arg
+                    .trim_start_matches("--onnx-quantized=")
+                    .trim()
+                    .to_ascii_lowercase();
+                let enabled = match v.as_str() {
+                    "1" | "true" | "on" | "yes" => true,
+                    "0" | "false" | "off" | "no" => false,
+                    _ => bail!("Invalid value for --onnx-quantized={v}; use true/false"),
+                };
+                cli_onnx_quantized = Some(enabled);
+            }
             _ => {
                 bail!(
-                    "Unknown argument: {arg}. Available arguments: -b/--backend, -m/--model, -i/--image, -v/--verbose, --no-verbose, -h/--help"
+                    "Unknown argument: {arg}. Available arguments: -b/--backend, -m/--model, -i/--image, --onnx-cpu, --onnx-quantized, -v/--verbose, --no-verbose, -h/--help"
                 );
             }
         }
@@ -212,6 +261,26 @@ fn parse_cli_options(
         (true, "DEFAULT")
     };
 
+    let (onnx_cpu, onnx_cpu_source) = if let Some(v) = cli_onnx_cpu {
+        (v, "CLI(--onnx-cpu/--no-onnx-cpu)")
+    } else if let Ok(v) = std::env::var("OCR_ONNX_CPU") {
+        let v = v.trim().to_ascii_lowercase();
+        let enabled = !(v == "0" || v == "false" || v == "off" || v == "no");
+        (enabled, "ENV(OCR_ONNX_CPU)")
+    } else {
+        (false, "DEFAULT")
+    };
+
+    let (onnx_quantized, onnx_quantized_source) = if let Some(v) = cli_onnx_quantized {
+        (v, "CLI(--onnx-quantized/--no-onnx-quantized)")
+    } else if let Ok(v) = std::env::var("OCR_ONNX_QUANTIZED") {
+        let v = v.trim().to_ascii_lowercase();
+        let enabled = !(v == "0" || v == "false" || v == "off" || v == "no");
+        (enabled, "ENV(OCR_ONNX_QUANTIZED)")
+    } else {
+        (false, "DEFAULT")
+    };
+
     Ok((
         backend,
         backend_source,
@@ -221,6 +290,10 @@ fn parse_cli_options(
         image_source,
         verbose,
         verbose_source,
+        onnx_cpu,
+        onnx_cpu_source,
+        onnx_quantized,
+        onnx_quantized_source,
     ))
 }
 
@@ -234,6 +307,10 @@ fn main() -> Result<()> {
         image_source,
         verbose,
         verbose_source,
+        onnx_cpu,
+        onnx_cpu_source,
+        onnx_quantized,
+        onnx_quantized_source,
     ) = parse_cli_options()?;
 
     std::env::set_var("OCR_VERBOSE", if verbose { "1" } else { "0" });
@@ -261,6 +338,14 @@ fn main() -> Result<()> {
         ));
         log_info(format!("Verbose: {} (source: {})", verbose, verbose_source));
         log_info(format!(
+            "ONNX CPU mode: {} (source: {})",
+            onnx_cpu, onnx_cpu_source
+        ));
+        log_info(format!(
+            "ONNX quantized mode: {} (source: {})",
+            onnx_quantized, onnx_quantized_source
+        ));
+        log_info(format!(
             "Pixel constraints: OCR_MIN_PIXELS={}, OCR_MAX_PIXELS={}",
             min_pixels, max_pixels
         ));
@@ -272,7 +357,7 @@ fn main() -> Result<()> {
 
     let infer_start = Instant::now();
     let mut backend: Box<dyn OcrBackend> = match backend_choice {
-        BackendChoice::Onnx => Box::new(OrtBackend::new()),
+        BackendChoice::Onnx => Box::new(OrtBackend::new(onnx_cpu, onnx_quantized)),
         BackendChoice::Native => Box::new(NativeBackend::new()),
     };
     if verbose {
