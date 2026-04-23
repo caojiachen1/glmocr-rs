@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Instant;
@@ -537,11 +536,43 @@ struct TextLayerWeights {
     down: Tensor,
 }
 
+struct VisionLayerWeights {
+    n1: Tensor,
+    n2: Tensor,
+    qkv_w: Tensor,
+    qkv_b: Option<Tensor>,
+    qn: Tensor,
+    kn: Tensor,
+    proj_w: Tensor,
+    proj_b: Option<Tensor>,
+    gate_w: Tensor,
+    gate_b: Option<Tensor>,
+    up_w: Tensor,
+    up_b: Option<Tensor>,
+    down_w: Tensor,
+    down_b: Option<Tensor>,
+}
+
+struct VisionWeights {
+    patch_w: Tensor,
+    patch_b: Option<Tensor>,
+    blocks: Vec<VisionLayerWeights>,
+    post_norm: Tensor,
+    downsample_w: Tensor,
+    downsample_b: Option<Tensor>,
+    merger_proj: Tensor,
+    merger_post_ln_w: Tensor,
+    merger_post_ln_b: Tensor,
+    merger_gate_w: Tensor,
+    merger_up_w: Tensor,
+    merger_down_w: Tensor,
+}
+
 struct SafetensorsModel {
     cfg: ModelConfig,
-    tensors: HashMap<String, Tensor>,
     device: Device,
     text_layers: Vec<TextLayerWeights>,
+    vision: VisionWeights,
     embed_tokens_w: Tensor,
     text_norm_w: Tensor,
     lm_head_w: Tensor,
@@ -563,79 +594,91 @@ impl SafetensorsModel {
         let weights_path = model_root.join("model.safetensors");
         let device = Device::Cpu;
         log_info(format!("Loading weights: {}", weights_path.display()));
-        let mut tensors = c(candle_core::safetensors::load(&weights_path, &device))
+        let tensors = c(candle_core::safetensors::load(&weights_path, &device))
             .with_context(|| format!("Failed to load safetensors: {}", weights_path.display()))?;
-        let total = tensors.len();
-        log_info(format!("Weights loaded, total tensors: {}. Converting to F32...", total));
-        for (idx, v) in tensors.values_mut().enumerate() {
-            if v.dtype() != DType::F32 {
-                *v = c(v.to_dtype(DType::F32))?;
+        log_info(format!("Weights loaded, total tensors: {}", tensors.len()));
+
+        let get_required_f32 = |name: &str| -> Result<Tensor> {
+            let t = tensors
+                .get(name)
+                .ok_or_else(|| anyhow!("Missing weight: {name}"))?
+                .clone();
+            if t.dtype() == DType::F32 {
+                Ok(t)
+            } else {
+                c(t.to_dtype(DType::F32))
             }
-            let done = idx + 1;
-            if done <= 3 || done == total || done % 100 == 0 {
-                log_info(format!("Weight conversion progress: {}/{}", done, total));
+        };
+
+        let get_optional_f32 = |name: &str| -> Result<Option<Tensor>> {
+            match tensors.get(name) {
+                Some(t) => {
+                    let t = t.clone();
+                    if t.dtype() == DType::F32 {
+                        Ok(Some(t))
+                    } else {
+                        Ok(Some(c(t.to_dtype(DType::F32))?))
+                    }
+                }
+                None => Ok(None),
             }
-        }
+        };
 
         let mut text_layers = Vec::with_capacity(cfg.text_config.num_hidden_layers);
         for layer in 0..cfg.text_config.num_hidden_layers {
             let lw = TextLayerWeights {
-                in_ln: tensors
-                    .get(&format!("model.language_model.layers.{layer}.input_layernorm.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.input_layernorm.weight"))?
-                    .clone(),
-                pa_ln: tensors
-                    .get(&format!("model.language_model.layers.{layer}.post_attention_layernorm.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.post_attention_layernorm.weight"))?
-                    .clone(),
-                psa_ln: tensors
-                    .get(&format!("model.language_model.layers.{layer}.post_self_attn_layernorm.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.post_self_attn_layernorm.weight"))?
-                    .clone(),
-                pm_ln: tensors
-                    .get(&format!("model.language_model.layers.{layer}.post_mlp_layernorm.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.post_mlp_layernorm.weight"))?
-                    .clone(),
-                q_w: tensors
-                    .get(&format!("model.language_model.layers.{layer}.self_attn.q_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.self_attn.q_proj.weight"))?
-                    .clone(),
-                k_w: tensors
-                    .get(&format!("model.language_model.layers.{layer}.self_attn.k_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.self_attn.k_proj.weight"))?
-                    .clone(),
-                v_w: tensors
-                    .get(&format!("model.language_model.layers.{layer}.self_attn.v_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.self_attn.v_proj.weight"))?
-                    .clone(),
-                o_w: tensors
-                    .get(&format!("model.language_model.layers.{layer}.self_attn.o_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.self_attn.o_proj.weight"))?
-                    .clone(),
-                gate_up: tensors
-                    .get(&format!("model.language_model.layers.{layer}.mlp.gate_up_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.mlp.gate_up_proj.weight"))?
-                    .clone(),
-                down: tensors
-                    .get(&format!("model.language_model.layers.{layer}.mlp.down_proj.weight"))
-                    .ok_or_else(|| anyhow!("Missing weight: model.language_model.layers.{layer}.mlp.down_proj.weight"))?
-                    .clone(),
+                in_ln: get_required_f32(&format!("model.language_model.layers.{layer}.input_layernorm.weight"))?,
+                pa_ln: get_required_f32(&format!("model.language_model.layers.{layer}.post_attention_layernorm.weight"))?,
+                psa_ln: get_required_f32(&format!("model.language_model.layers.{layer}.post_self_attn_layernorm.weight"))?,
+                pm_ln: get_required_f32(&format!("model.language_model.layers.{layer}.post_mlp_layernorm.weight"))?,
+                q_w: get_required_f32(&format!("model.language_model.layers.{layer}.self_attn.q_proj.weight"))?,
+                k_w: get_required_f32(&format!("model.language_model.layers.{layer}.self_attn.k_proj.weight"))?,
+                v_w: get_required_f32(&format!("model.language_model.layers.{layer}.self_attn.v_proj.weight"))?,
+                o_w: get_required_f32(&format!("model.language_model.layers.{layer}.self_attn.o_proj.weight"))?,
+                gate_up: get_required_f32(&format!("model.language_model.layers.{layer}.mlp.gate_up_proj.weight"))?,
+                down: get_required_f32(&format!("model.language_model.layers.{layer}.mlp.down_proj.weight"))?,
             };
             text_layers.push(lw);
         }
 
-        let embed_tokens_w = tensors
-            .get("model.language_model.embed_tokens.weight")
-            .ok_or_else(|| anyhow!("Missing weight: model.language_model.embed_tokens.weight"))?
-            .clone();
-        let text_norm_w = tensors
-            .get("model.language_model.norm.weight")
-            .ok_or_else(|| anyhow!("Missing weight: model.language_model.norm.weight"))?
-            .clone();
-        let lm_head_w = tensors
-            .get("lm_head.weight")
-            .ok_or_else(|| anyhow!("Missing weight: lm_head.weight"))?
-            .clone();
+        let mut vision_blocks = Vec::with_capacity(cfg.vision_config.depth);
+        for layer in 0..cfg.vision_config.depth {
+            vision_blocks.push(VisionLayerWeights {
+                n1: get_required_f32(&format!("model.visual.blocks.{layer}.norm1.weight"))?,
+                n2: get_required_f32(&format!("model.visual.blocks.{layer}.norm2.weight"))?,
+                qkv_w: get_required_f32(&format!("model.visual.blocks.{layer}.attn.qkv.weight"))?,
+                qkv_b: get_optional_f32(&format!("model.visual.blocks.{layer}.attn.qkv.bias"))?,
+                qn: get_required_f32(&format!("model.visual.blocks.{layer}.attn.q_norm.weight"))?,
+                kn: get_required_f32(&format!("model.visual.blocks.{layer}.attn.k_norm.weight"))?,
+                proj_w: get_required_f32(&format!("model.visual.blocks.{layer}.attn.proj.weight"))?,
+                proj_b: get_optional_f32(&format!("model.visual.blocks.{layer}.attn.proj.bias"))?,
+                gate_w: get_required_f32(&format!("model.visual.blocks.{layer}.mlp.gate_proj.weight"))?,
+                gate_b: get_optional_f32(&format!("model.visual.blocks.{layer}.mlp.gate_proj.bias"))?,
+                up_w: get_required_f32(&format!("model.visual.blocks.{layer}.mlp.up_proj.weight"))?,
+                up_b: get_optional_f32(&format!("model.visual.blocks.{layer}.mlp.up_proj.bias"))?,
+                down_w: get_required_f32(&format!("model.visual.blocks.{layer}.mlp.down_proj.weight"))?,
+                down_b: get_optional_f32(&format!("model.visual.blocks.{layer}.mlp.down_proj.bias"))?,
+            });
+        }
+
+        let vision = VisionWeights {
+            patch_w: get_required_f32("model.visual.patch_embed.proj.weight")?,
+            patch_b: get_optional_f32("model.visual.patch_embed.proj.bias")?,
+            blocks: vision_blocks,
+            post_norm: get_required_f32("model.visual.post_layernorm.weight")?,
+            downsample_w: get_required_f32("model.visual.downsample.weight")?,
+            downsample_b: get_optional_f32("model.visual.downsample.bias")?,
+            merger_proj: get_required_f32("model.visual.merger.proj.weight")?,
+            merger_post_ln_w: get_required_f32("model.visual.merger.post_projection_norm.weight")?,
+            merger_post_ln_b: get_required_f32("model.visual.merger.post_projection_norm.bias")?,
+            merger_gate_w: get_required_f32("model.visual.merger.gate_proj.weight")?,
+            merger_up_w: get_required_f32("model.visual.merger.up_proj.weight")?,
+            merger_down_w: get_required_f32("model.visual.merger.down_proj.weight")?,
+        };
+
+        let embed_tokens_w = get_required_f32("model.language_model.embed_tokens.weight")?;
+        let text_norm_w = get_required_f32("model.language_model.norm.weight")?;
+        let lm_head_w = get_required_f32("lm_head.weight")?;
 
         let dim = cfg.text_config.head_dim;
         let inv_len = dim / 2;
@@ -650,21 +693,15 @@ impl SafetensorsModel {
 
         Ok(Self {
             cfg,
-            tensors,
             device,
             text_layers,
+            vision,
             embed_tokens_w,
             text_norm_w,
             lm_head_w,
             text_inv_freq,
             kv_repeat,
         })
-    }
-
-    fn t(&self, name: &str) -> Result<&Tensor> {
-        self.tensors
-            .get(name)
-            .ok_or_else(|| anyhow!("Missing weight: {name}"))
     }
 
     fn embed_ids(&self, ids: &[i64]) -> Result<Tensor> {
@@ -698,6 +735,7 @@ impl SafetensorsModel {
 
     fn vision_forward(&self, pixel_values: &Array2<f32>, image_grid_thw: &Array2<i64>) -> Result<Tensor> {
         let vt = &self.cfg.vision_config;
+        let vw = &self.vision;
         let dev = &self.device;
         log_info(format!(
             "vision_forward: num_patches={}, hidden_size={}, depth={}",
@@ -712,8 +750,8 @@ impl SafetensorsModel {
             dev,
         ))?;
 
-        let patch_w = c(self.t("model.visual.patch_embed.proj.weight")?.reshape((vt.hidden_size, 3 * 2 * 14 * 14)))?;
-        let patch_b = self.t("model.visual.patch_embed.proj.bias").ok();
+        let patch_w = c(vw.patch_w.reshape((vt.hidden_size, 3 * 2 * 14 * 14)))?;
+        let patch_b = vw.patch_b.as_ref();
         let mut hidden = linear(&x, &patch_w, patch_b)?; // [num_patches, 1024]
 
         // 2D rotary for vision
@@ -772,23 +810,20 @@ impl SafetensorsModel {
 
         for layer in 0..vt.depth {
             let layer_t = Instant::now();
-            let n1 = self.t(&format!("model.visual.blocks.{layer}.norm1.weight"))?;
-            let n2 = self.t(&format!("model.visual.blocks.{layer}.norm2.weight"))?;
+            let lw = &vw.blocks[layer];
+            let n1 = &lw.n1;
+            let n2 = &lw.n2;
 
             let a_in = rms_norm(&hidden, n1, vt.rms_norm_eps)?;
 
-            let qkv_w = self.t(&format!("model.visual.blocks.{layer}.attn.qkv.weight"))?;
-            let qkv_b = self.t(&format!("model.visual.blocks.{layer}.attn.qkv.bias")).ok();
-            let mut qkv = linear(&a_in, qkv_w, qkv_b)?; // [seq, 3072]
+            let mut qkv = linear(&a_in, &lw.qkv_w, lw.qkv_b.as_ref())?; // [seq, 3072]
             qkv = c(qkv.reshape((seq, 3, vt.num_heads, head_dim)))?;
             let mut q = c(qkv.i((.., 0, .., ..)))?;
             let mut k = c(qkv.i((.., 1, .., ..)))?;
             let v = c(qkv.i((.., 2, .., ..)))?;
 
-            let qn = self.t(&format!("model.visual.blocks.{layer}.attn.q_norm.weight"))?;
-            let kn = self.t(&format!("model.visual.blocks.{layer}.attn.k_norm.weight"))?;
-            q = rms_norm(&q, qn, vt.rms_norm_eps)?;
-            k = rms_norm(&k, kn, vt.rms_norm_eps)?;
+            q = rms_norm(&q, &lw.qn, vt.rms_norm_eps)?;
+            k = rms_norm(&k, &lw.kn, vt.rms_norm_eps)?;
 
             // vision rotary
             let cos_u = c(cos_t.unsqueeze(D::Minus2))?;
@@ -806,23 +841,14 @@ impl SafetensorsModel {
             let attn = c(c(attn.squeeze(0))?.transpose(0, 1))?;
             let attn = c(attn.reshape((seq, vt.hidden_size)))?;
 
-            let proj_w = self.t(&format!("model.visual.blocks.{layer}.attn.proj.weight"))?;
-            let proj_b = self.t(&format!("model.visual.blocks.{layer}.attn.proj.bias")).ok();
-            let attn_out = linear(&attn, proj_w, proj_b)?;
+            let attn_out = linear(&attn, &lw.proj_w, lw.proj_b.as_ref())?;
 
             let h1 = c(&hidden + &attn_out)?;
             let m_in = rms_norm(&h1, n2, vt.rms_norm_eps)?;
 
-            let gate_w = self.t(&format!("model.visual.blocks.{layer}.mlp.gate_proj.weight"))?;
-            let gate_b = self.t(&format!("model.visual.blocks.{layer}.mlp.gate_proj.bias")).ok();
-            let up_w = self.t(&format!("model.visual.blocks.{layer}.mlp.up_proj.weight"))?;
-            let up_b = self.t(&format!("model.visual.blocks.{layer}.mlp.up_proj.bias")).ok();
-            let down_w = self.t(&format!("model.visual.blocks.{layer}.mlp.down_proj.weight"))?;
-            let down_b = self.t(&format!("model.visual.blocks.{layer}.mlp.down_proj.bias")).ok();
-
-            let gate = c(linear(&m_in, gate_w, gate_b)?.silu())?;
-            let up = linear(&m_in, up_w, up_b)?;
-            let mlp = linear(&c(&gate * &up)?, down_w, down_b)?;
+            let gate = c(linear(&m_in, &lw.gate_w, lw.gate_b.as_ref())?.silu())?;
+            let up = linear(&m_in, &lw.up_w, lw.up_b.as_ref())?;
+            let mlp = linear(&c(&gate * &up)?, &lw.down_w, lw.down_b.as_ref())?;
 
             hidden = c(&h1 + &mlp)?;
 
@@ -836,33 +862,25 @@ impl SafetensorsModel {
             }
         }
 
-        let post_norm = self.t("model.visual.post_layernorm.weight")?;
-        hidden = rms_norm(&hidden, post_norm, vt.rms_norm_eps)?;
+        hidden = rms_norm(&hidden, &vw.post_norm, vt.rms_norm_eps)?;
 
         // downsample conv2d(kernel=2,stride=2) == linear over flattened 2x2x1024
         let n_groups = seq / 4;
         let hidden = c(hidden.reshape((n_groups, 2, 2, vt.hidden_size)))?;
         let hidden = c(hidden.permute((0, 3, 1, 2)))?;
         let hidden = c(hidden.reshape((n_groups, vt.hidden_size * 4)))?;
-        let ds_w = c(self.t("model.visual.downsample.weight")?.reshape((vt.out_hidden_size, vt.hidden_size * 4)))?;
-        let ds_b = self.t("model.visual.downsample.bias").ok();
+        let ds_w = c(vw.downsample_w.reshape((vt.out_hidden_size, vt.hidden_size * 4)))?;
+        let ds_b = vw.downsample_b.as_ref();
         let mut hidden = linear(&hidden, &ds_w, ds_b)?;
 
         // merger
-        let merger_proj = self.t("model.visual.merger.proj.weight")?;
-        hidden = linear(&hidden, merger_proj, None)?;
+        hidden = linear(&hidden, &vw.merger_proj, None)?;
 
-        let ln_w = self.t("model.visual.merger.post_projection_norm.weight")?;
-        let ln_b = self.t("model.visual.merger.post_projection_norm.bias")?;
-        hidden = c(layer_norm(&hidden, ln_w, ln_b, 1e-5)?.gelu())?;
+        hidden = c(layer_norm(&hidden, &vw.merger_post_ln_w, &vw.merger_post_ln_b, 1e-5)?.gelu())?;
 
-        let gate_w = self.t("model.visual.merger.gate_proj.weight")?;
-        let up_w = self.t("model.visual.merger.up_proj.weight")?;
-        let down_w = self.t("model.visual.merger.down_proj.weight")?;
-
-        let gate = c(linear(&hidden, gate_w, None)?.silu())?;
-        let up = linear(&hidden, up_w, None)?;
-        hidden = linear(&c(&gate * &up)?, down_w, None)?;
+        let gate = c(linear(&hidden, &vw.merger_gate_w, None)?.silu())?;
+        let up = linear(&hidden, &vw.merger_up_w, None)?;
+        hidden = linear(&c(&gate * &up)?, &vw.merger_down_w, None)?;
 
         Ok(hidden)
     }
