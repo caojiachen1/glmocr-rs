@@ -5,6 +5,7 @@ use std::io::Write;
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::utils::cuda_is_available;
 use candle_nn::ops;
 use image::{imageops::FilterType, DynamicImage};
 use ndarray::{s, Array2, Array3, Array4};
@@ -54,10 +55,36 @@ fn c<T>(r: candle_core::Result<T>) -> Result<T> {
     r.map_err(|e| anyhow!(e.to_string()))
 }
 
-static CPU_RT_INIT: Once = Once::new();
+static RT_INIT: Once = Once::new();
 
-fn init_cpu_runtime() {
-    CPU_RT_INIT.call_once(|| {
+/// Detect and return the best available device (CUDA > CPU)
+/// If force_cpu is true, always return CPU device
+fn get_device(force_cpu: bool) -> Result<Device> {
+    if force_cpu {
+        log_info("CPU mode forced: using CPU device");
+        return Ok(Device::Cpu);
+    }
+    
+    if cuda_is_available() {
+        log_info("CUDA is available, using GPU device");
+        match Device::new_cuda(0) {
+            Ok(device) => {
+                log_info(format!("CUDA device initialized: {:?}", device));
+                Ok(device)
+            }
+            Err(e) => {
+                log_info(format!("Failed to initialize CUDA device: {}, falling back to CPU", e));
+                Ok(Device::Cpu)
+            }
+        }
+    } else {
+        log_info("CUDA is not available, using CPU device");
+        Ok(Device::Cpu)
+    }
+}
+
+fn init_runtime() {
+    RT_INIT.call_once(|| {
         if let Ok(nz) = std::thread::available_parallelism() {
             let n = nz.get();
             let _ = std::env::set_var("RAYON_NUM_THREADS", n.to_string());
@@ -75,7 +102,7 @@ fn init_cpu_runtime() {
             log_info(format!(
                 "CPU features: avx={}, avx2={}, fma={}, avx512f={}, avx512bf16={}",
                 avx, avx2, fma, avx512f, bf16
-            ));
+            )); 
         }
     });
 }
@@ -559,12 +586,12 @@ fn attention_grouped_kv(
         let k_g = c(k.narrow(1, kvh, 1))?;
         let v_g = c(v.narrow(1, kvh, 1))?;
         
-        // Broadcast k and v to match q's head count
-        let k_g = c(k_g.broadcast_as((b, kv_repeat, k_len, head_dim)))?;
-        let v_g = c(v_g.broadcast_as((b, kv_repeat, v_len, head_dim)))?;
+        // Broadcast k and v to match q's head count, ensure contiguous for CUDA matmul
+        let k_g = c(c(k_g.broadcast_as((b, kv_repeat, k_len, head_dim)))?.contiguous())?;
+        let v_g = c(c(v_g.broadcast_as((b, kv_repeat, v_len, head_dim)))?.contiguous())?;
 
         // Compute attention scores
-        let k_t = c(k_g.transpose(2, 3))?;
+        let k_t = c(c(k_g.transpose(2, 3))?.contiguous())?;
         let mut scores = c(c(q_g.matmul(&k_t))? * scale)?;
         
         if let Some(attn_mask) = mask {
@@ -644,7 +671,7 @@ struct SafetensorsModel {
 }
 
 impl SafetensorsModel {
-    fn load(model_root: &Path) -> Result<Self> {
+    fn load(model_root: &Path, force_cpu: bool) -> Result<Self> {
         let total_t = Instant::now();
         log_stage_start("Load safetensors model");
 
@@ -655,7 +682,7 @@ impl SafetensorsModel {
         log_info(format!("Config loaded: {}", config_path.display()));
 
         let weights_path = model_root.join("model.safetensors");
-        let device = Device::Cpu;
+        let device = get_device(force_cpu)?;
         log_info(format!("Loading weights: {}", weights_path.display()));
         let tensors = c(candle_core::safetensors::load(&weights_path, &device))
             .with_context(|| format!("Failed to load safetensors: {}", weights_path.display()))?;
@@ -933,11 +960,11 @@ impl SafetensorsModel {
                 let offset = c_idx * chunk_size;
                 let len = chunk_size.min(seq - offset);
                 
-                let q_chunk = c(q.narrow(2, offset, len))?;
-                let k_chunk = c(k.narrow(2, offset, len))?;
-                let v_chunk = c(v.narrow(2, offset, len))?;
+                let q_chunk = c(c(q.narrow(2, offset, len))?.contiguous())?;
+                let k_chunk = c(c(k.narrow(2, offset, len))?.contiguous())?;
+                let v_chunk = c(c(v.narrow(2, offset, len))?.contiguous())?;
                 
-                let k_t = c(k_chunk.t())?;
+                let k_t = c(c(k_chunk.t())?.contiguous())?;
                 let scores = c(c(q_chunk.matmul(&k_t))? * (1.0 / (head_dim as f64).sqrt()))?;
                 let probs = ops::softmax_last_dim(&scores).map_err(|e| anyhow!(e.to_string()))?;
                 let attn_chunk = c(probs.matmul(&v_chunk))?;
@@ -1139,11 +1166,13 @@ impl SafetensorsModel {
     }
 }
 
-pub struct NativeBackend;
+pub struct NativeBackend {
+    force_cpu: bool,
+}
 
 impl NativeBackend {
-    pub fn new() -> Self {
-        Self
+    pub fn new(force_cpu: bool) -> Self {
+        Self { force_cpu }
     }
 
     fn model_paths(model_root: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -1157,7 +1186,11 @@ impl NativeBackend {
 
 impl OcrBackend for NativeBackend {
     fn name(&self) -> &'static str {
-        "native"
+        if self.force_cpu {
+            "native (CPU forced)"
+        } else {
+            "native"
+        }
     }
 
     fn infer(
@@ -1167,7 +1200,7 @@ impl OcrBackend for NativeBackend {
         min_pixels: usize,
         max_pixels: usize,
     ) -> Result<String> {
-        init_cpu_runtime();
+        init_runtime();
         if cfg!(debug_assertions) {
             log_info("Debug build detected; CPU inference can be much slower. Consider running `cargo run --release`");
         }
@@ -1191,7 +1224,7 @@ impl OcrBackend for NativeBackend {
         let stage = "Load safetensors weights";
         let stage_t = Instant::now();
         log_stage_start(stage);
-        let model = SafetensorsModel::load(model_root)?;
+        let model = SafetensorsModel::load(model_root, self.force_cpu)?;
         log_stage_end(stage, stage_t);
         if model.cfg.image_token_id != IMAGE_TOKEN_ID {
             bail!(

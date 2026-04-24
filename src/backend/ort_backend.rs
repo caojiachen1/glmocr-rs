@@ -436,7 +436,11 @@ impl OrtBackend {
 
 impl OcrBackend for OrtBackend {
     fn name(&self) -> &'static str {
-        "ort"
+        if self.force_cpu {
+            "ort (CPU forced)"
+        } else {
+            "ort"
+        }
     }
 
     fn infer(
