@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use rayon::ThreadPoolBuilder;
 
-use super::OcrBackend;
+use super::{OcrBackend, InferResult};
 
 const IMAGE_TOKEN_ID: i64 = 59280;
 const EOS_TOKEN_IDS: [i64; 2] = [59246, 59253];
@@ -1190,7 +1190,7 @@ impl OcrBackend for NativeBackend {
         image_path: &Path,
         min_pixels: usize,
         max_pixels: usize,
-    ) -> Result<String> {
+    ) -> Result<InferResult> {
         init_runtime();
         if cfg!(debug_assertions) {
             log_info("Debug build detected; CPU inference can be much slower. Consider running `cargo run --release`");
@@ -1391,6 +1391,9 @@ impl OcrBackend for NativeBackend {
 
         log_info(format!("Inference finished, elapsed {:.3}s", total_t.elapsed().as_secs_f64()));
         log_stage_end("safetensors OCR inference", total_t);
-        Ok(decoded)
+        Ok(InferResult {
+            text: decoded,
+            token_count: generated.len(),
+        })
     }
 }

@@ -12,7 +12,7 @@ use ort::{
 };
 use tokenizers::Tokenizer;
 
-use super::OcrBackend;
+use super::{OcrBackend, InferResult};
 
 const IMAGE_TOKEN_ID: i64 = 59280;
 const EOS_TOKEN_IDS: [i64; 2] = [59246, 59253];
@@ -449,7 +449,7 @@ impl OcrBackend for OrtBackend {
         image_path: &Path,
         min_pixels: usize,
         max_pixels: usize,
-    ) -> Result<String> {
+    ) -> Result<InferResult> {
         let total_start = Instant::now();
         log_stage_start("GLM OCR ONNX Rust inference");
 
@@ -769,6 +769,9 @@ impl OcrBackend for OrtBackend {
         log_info(format!("Total elapsed: {:.3}s", total_start.elapsed().as_secs_f64()));
         log_stage_end("GLM OCR ONNX Rust inference", total_start);
 
-        Ok(decoded)
+        Ok(InferResult {
+            text: decoded,
+            token_count: generated_ids.len(),
+        })
     }
 }

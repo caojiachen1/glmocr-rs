@@ -363,13 +363,24 @@ fn main() -> Result<()> {
     if verbose {
         log_info(format!("Active backend: {}", backend.name()));
     }
-    let decoded = backend.infer(&model_root, &input_image_path, min_pixels, max_pixels)?;
+    let result = backend.infer(&model_root, &input_image_path, min_pixels, max_pixels)?;
     if verbose {
+        let elapsed = infer_start.elapsed().as_secs_f64();
+        let tokens_per_second = if elapsed > 0.0 {
+            result.token_count as f64 / elapsed
+        } else {
+            0.0
+        };
         log_info(format!(
             "Main inference stage elapsed: {:.3}s",
-            infer_start.elapsed().as_secs_f64()
+            elapsed
+        ));
+        log_info(format!(
+            "Decode speed: {:.2} tokens/s ({} tokens in {:.3}s)",
+            tokens_per_second, result.token_count, elapsed
         ));
     }
+    let decoded = result.text;
 
     let output_path = PathBuf::from("output.md");
     fs::write(&output_path, decoded.trim())
