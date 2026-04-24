@@ -1289,9 +1289,12 @@ impl OcrBackend for NativeBackend {
 
         let max_new_tokens = std::env::var("OCR_MAX_NEW_TOKENS")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512);
-        log_info(format!("Maximum new decode tokens: {}", max_new_tokens));
+            .and_then(|v| v.parse::<usize>().ok());
+        
+        match max_new_tokens {
+            Some(limit) => log_info(format!("Maximum new decode tokens: {}", limit)),
+            None => log_info("Maximum new decode tokens: unlimited (will stop on EOS)"),
+        }
 
         let decode_t = Instant::now();
         log_stage_start("Autoregressive decode");
@@ -1328,11 +1331,21 @@ impl OcrBackend for NativeBackend {
             }
         }
 
-        for step in 0..max_new_tokens {
+        let mut step = 0usize;
+        loop {
             let next = *generated.last().unwrap();
             if EOS_TOKEN_IDS.contains(&next) {
                 break;
             }
+            
+            // 如果设置了最大token数限制则检查
+            if let Some(limit) = max_new_tokens {
+                if step >= limit {
+                    log_info(format!("Reached maximum token limit: {}, stopping generation", limit));
+                    break;
+                }
+            }
+            
             let past = cache
                 .first()
                 .and_then(|x| x.k.as_ref())
@@ -1375,6 +1388,8 @@ impl OcrBackend for NativeBackend {
             if EOS_TOKEN_IDS.contains(&tok) {
                 break;
             }
+            
+            step += 1;
         }
         log_stage_end("Autoregressive decode", decode_t);
 
