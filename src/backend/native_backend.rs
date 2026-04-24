@@ -931,10 +931,10 @@ impl SafetensorsModel {
             let mut qkv = linear(&a_in, &lw.qkv_w, lw.qkv_b.as_ref())?;
             qkv = c(qkv.reshape((seq, 3, vt.num_heads, head_dim)))?;
             
-            // Extract q, k, v with minimal allocations
-            let mut q = c(qkv.i((.., 0, .., ..)))?;
-            let mut k = c(qkv.i((.., 1, .., ..)))?;
-            let v = c(qkv.i((.., 2, .., ..)))?;
+            // Extract q, k, v and ensure contiguous
+            let mut q = c(qkv.i((.., 0, .., ..)).and_then(|t| t.contiguous()))?;
+            let mut k = c(qkv.i((.., 1, .., ..)).and_then(|t| t.contiguous()))?;
+            let v = c(qkv.i((.., 2, .., ..)).and_then(|t| t.contiguous()))?;
 
             // Apply per-head norm
             q = rms_norm(&q, &lw.qn, vt.rms_norm_eps)?;
@@ -948,28 +948,19 @@ impl SafetensorsModel {
 
             // Reshape for attention: [seq, heads, dim] -> [1, heads, seq, dim]
             let q = c(c(q.transpose(0, 1))?.unsqueeze(0))?;
+            let q = c(q.contiguous())?;
             let k = c(c(k.transpose(0, 1))?.unsqueeze(0))?;
+            let k = c(k.contiguous())?;
             let v = c(c(v.transpose(0, 1))?.unsqueeze(0))?;
+            let v = c(v.contiguous())?;
 
-            // Compute attention with chunking for memory efficiency (inspired by vllm.rs)
-            let chunk_size = 512;
-            let num_chunks = (seq + chunk_size - 1) / chunk_size;
-            let mut attn_chunks = Vec::with_capacity(num_chunks);
-            
-            for c_idx in 0..num_chunks {
-                let offset = c_idx * chunk_size;
-                let len = chunk_size.min(seq - offset);
-                
-                let q_chunk = c(c(q.narrow(2, offset, len))?.contiguous())?;
-                let k_chunk = c(c(k.narrow(2, offset, len))?.contiguous())?;
-                let v_chunk = c(c(v.narrow(2, offset, len))?.contiguous())?;
-                
-                let k_t = c(c(k_chunk.t())?.contiguous())?;
-                let scores = c(c(q_chunk.matmul(&k_t))? * (1.0 / (head_dim as f64).sqrt()))?;
-                let probs = ops::softmax_last_dim(&scores).map_err(|e| anyhow!(e.to_string()))?;
-                let attn_chunk = c(probs.matmul(&v_chunk))?;
-                attn_chunks.push(attn_chunk);
-            }
+            // Compute attention: each query token should attend to ALL key/value tokens
+            // Fixed: removed the buggy chunked attention that only attended within chunks
+            let k_t = c(c(k.transpose(2, 3))?.contiguous())?;
+            let scores = c(c(q.matmul(&k_t))? * (1.0 / (head_dim as f64).sqrt()))?;
+            let probs = ops::softmax_last_dim(&scores).map_err(|e| anyhow!(e.to_string()))?;
+            let attn = c(probs.matmul(&v))?;
+            let attn_chunks = vec![attn];
             
             let attn = if attn_chunks.len() == 1 {
                 attn_chunks.into_iter().next().unwrap()
