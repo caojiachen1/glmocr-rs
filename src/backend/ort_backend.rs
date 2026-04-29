@@ -12,8 +12,9 @@ use ort::{
 };
 use tokenizers::Tokenizer;
 
-use super::{OcrBackend, InferResult};
+use super::{OcrBackend, InferResult, is_verbose, log_info, log_stage_start, log_stage_end, log_stream};
 
+const TAG: &str = "ONNX";
 const IMAGE_TOKEN_ID: i64 = 59280;
 const EOS_TOKEN_IDS: [i64; 2] = [59246, 59253];
 const HIDDEN_SIZE: usize = 1536;
@@ -23,34 +24,6 @@ const HEAD_DIM: usize = 128;
 const PATCH_SIZE: usize = 14;
 const TEMPORAL_PATCH_SIZE: usize = 2;
 const MERGE_SIZE: usize = 2;
-
-fn log_info(message: impl AsRef<str>) {
-    if is_verbose() {
-        eprintln!("[OCR][INFO] {}", message.as_ref());
-    }
-}
-
-fn log_stage_start(stage: impl AsRef<str>) {
-    if is_verbose() {
-        eprintln!("[OCR][STAGE] >>> {}", stage.as_ref());
-    }
-}
-
-fn log_stage_end(stage: impl AsRef<str>, started_at: Instant) {
-    if is_verbose() {
-        eprintln!(
-            "[OCR][STAGE] <<< {} (elapsed: {:.3}s)",
-            stage.as_ref(),
-            started_at.elapsed().as_secs_f64()
-        );
-    }
-}
-
-fn is_verbose() -> bool {
-    let v = std::env::var("OCR_VERBOSE").unwrap_or_else(|_| "1".to_string());
-    let v = v.trim().to_ascii_lowercase();
-    !(v == "0" || v == "false" || v == "off" || v == "no")
-}
 
 fn ok<T, E: std::fmt::Display>(res: std::result::Result<T, E>) -> Result<T> {
     res.map_err(|e| anyhow!(e.to_string()))
@@ -75,7 +48,7 @@ fn create_session_with_cuda_fallback(
                 model_path.display()
             )
         })?;
-        log_info(format!(
+        log_info(TAG, format!(
             "{} initialized (CPU only mode, elapsed: {:.3}s)",
             session_name,
             t.elapsed().as_secs_f64()
@@ -85,7 +58,7 @@ fn create_session_with_cuda_fallback(
 
     let cuda_ep = CUDAExecutionProvider::default();
     if !cuda_ep.supported_by_platform() {
-        log_info(format!(
+        log_info(TAG, format!(
             "{} CUDAExecutionProvider is not supported on this platform, falling back to CPU",
             session_name
         ));
@@ -102,7 +75,7 @@ fn create_session_with_cuda_fallback(
                                 Ok(id) => format!("device_id={id}"),
                                 Err(e) => format!("device_id=unknown ({e})"),
                             };
-                            log_info(format!(
+                            log_info(TAG, format!(
                                 "{} initialized (CUDAExecutionProvider enabled, {}, elapsed: {:.3}s)",
                                 session_name,
                                 device_msg,
@@ -111,14 +84,14 @@ fn create_session_with_cuda_fallback(
                             return Ok(session);
                         }
                         Err(cuda_err) => {
-                            log_info(format!(
+                            log_info(TAG, format!(
                                 "{} failed to create CUDA session, falling back to CPU: {}",
                                 session_name, cuda_err
                             ));
                         }
                     },
                     Err(cuda_err) => {
-                        log_info(format!(
+                        log_info(TAG, format!(
                             "{} failed to register CUDA provider, falling back to CPU: {}",
                             session_name, cuda_err
                         ));
@@ -126,13 +99,13 @@ fn create_session_with_cuda_fallback(
                 }
             }
             Ok(false) => {
-                log_info(format!(
+                log_info(TAG, format!(
                     "{} CUDAExecutionProvider is unavailable (ORT build/dependencies), falling back to CPU",
                     session_name
                 ));
             }
             Err(e) => {
-                log_info(format!(
+                log_info(TAG, format!(
                     "{} failed to check CUDAExecutionProvider availability, falling back to CPU: {}",
                     session_name, e
                 ));
@@ -151,7 +124,7 @@ fn create_session_with_cuda_fallback(
             model_path.display()
         )
     })?;
-    log_info(format!(
+    log_info(TAG, format!(
         "{} initialized (CPU fallback, elapsed: {:.3}s)",
         session_name,
         t.elapsed().as_secs_f64()
@@ -189,14 +162,14 @@ fn preprocess_image(
 ) -> Result<(Array2<f32>, Array2<i64>)> {
     let stage = "Image preprocessing";
     let stage_start = Instant::now();
-    log_stage_start(stage);
-    log_info(format!("Loading image: {}", image_path.display()));
+    log_stage_start(TAG, stage);
+    log_info(TAG, format!("Loading image: {}", image_path.display()));
 
     let image = image::open(image_path)
         .with_context(|| format!("Failed to open input image: {}", image_path.display()))?;
     let rgb = to_rgb(image);
     let (orig_w, orig_h) = rgb.dimensions();
-    log_info(format!("Original resolution: {}x{}", orig_w, orig_h));
+    log_info(TAG, format!("Original resolution: {}x{}", orig_w, orig_h));
 
     let (target_h, target_w) = smart_resize(
         orig_h as usize,
@@ -205,7 +178,7 @@ fn preprocess_image(
         min_pixels,
         max_pixels,
     );
-    log_info(format!("Resized resolution: {}x{}", target_w, target_h));
+    log_info(TAG, format!("Resized resolution: {}x{}", target_w, target_h));
 
     let resized = image::imageops::resize(&rgb, target_w as u32, target_h as u32, FilterType::CatmullRom);
 
@@ -230,7 +203,7 @@ fn preprocess_image(
 
     let grid_h = target_h / PATCH_SIZE;
     let grid_w = target_w / PATCH_SIZE;
-    log_info(format!("Patch grid: grid_h={}, grid_w={}", grid_h, grid_w));
+    log_info(TAG, format!("Patch grid: grid_h={}, grid_w={}", grid_h, grid_w));
 
     let mut pixel_values = Vec::<f32>::with_capacity(grid_h * grid_w * 1176);
     for gh_block in 0..(grid_h / MERGE_SIZE) {
@@ -257,7 +230,7 @@ fn preprocess_image(
 
     let num_patches = grid_h * grid_w;
     if num_patches > 4096 {
-        log_info(format!(
+        log_info(TAG, format!(
             "Warning: num_patches={} is large; vision encoding may be slow. Consider lowering OCR_MAX_PIXELS",
             num_patches
         ));
@@ -267,12 +240,12 @@ fn preprocess_image(
     let image_grid_thw = Array2::from_shape_vec((1, 3), vec![1i64, grid_h as i64, grid_w as i64])
         .context("Failed to build image_grid_thw")?;
 
-    log_info(format!(
+    log_info(TAG, format!(
         "pixel_values shape={:?}, image_grid_thw={:?}",
         pixel_values.shape(),
         image_grid_thw
     ));
-    log_stage_end(stage, stage_start);
+    log_stage_end(TAG, stage, stage_start);
 
     Ok((pixel_values, image_grid_thw))
 }
@@ -451,14 +424,14 @@ impl OcrBackend for OrtBackend {
         max_pixels: usize,
     ) -> Result<InferResult> {
         let total_start = Instant::now();
-        log_stage_start("GLM OCR ONNX Rust inference");
+        log_stage_start(TAG, "GLM OCR ONNX Rust inference");
 
         if self.force_cpu {
-            log_info("ONNX execution mode: CPU only");
+            log_info(TAG, "ONNX execution mode: CPU only");
         } else {
-            log_info("ONNX execution mode: auto CUDA -> CPU fallback");
+            log_info(TAG, "ONNX execution mode: auto CUDA -> CPU fallback");
         }
-        log_info(format!(
+        log_info(TAG, format!(
             "ONNX model precision mode: {}",
             if self.quantized { "quantized" } else { "default" }
         ));
@@ -471,11 +444,11 @@ impl OcrBackend for OrtBackend {
                 bail!("Missing model file: {}", p.display());
             }
         }
-        log_info("File check passed: tokenizer + vision + embed + decoder all exist");
+        log_info(TAG, "File check passed: tokenizer + vision + embed + decoder all exist");
 
         let stage = "Load ONNX sessions";
         let stage_start = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
 
         let mut vision_session =
             create_session_with_cuda_fallback(&vision_path, "vision_session", self.force_cpu)?;
@@ -487,36 +460,36 @@ impl OcrBackend for OrtBackend {
             self.force_cpu,
         )?;
 
-        log_stage_end(stage, stage_start);
+        log_stage_end(TAG, stage, stage_start);
 
         let stage = "Load tokenizer";
         let stage_start = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!(e.to_string()))?;
-        log_stage_end(stage, stage_start);
+        log_stage_end(TAG, stage, stage_start);
 
         let (pixel_values, image_grid_thw) = preprocess_image(image_path, min_pixels, max_pixels)?;
 
         let stage = "Vision encoding (vision_encoder)";
         let stage_start = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let image_features = {
-            log_info("Preparing vision input tensors (pixel_values / image_grid_thw)");
+            log_info(TAG, "Preparing vision input tensors (pixel_values / image_grid_thw)");
             let t_build = Instant::now();
             let pixel_values_tensor = ok(Tensor::from_array(pixel_values.clone()))?;
             let image_grid_thw_tensor = ok(Tensor::from_array(image_grid_thw.clone()))?;
-            log_info(format!(
+            log_info(TAG, format!(
                 "Vision input tensors prepared (elapsed: {:.3}s)",
                 t_build.elapsed().as_secs_f64()
             ));
 
-            log_info("Running vision_session.run(...)");
+            log_info(TAG, "Running vision_session.run(...)");
             let t_run = Instant::now();
             let vision_outputs = ok(vision_session.run(ort::inputs! {
                 "pixel_values" => pixel_values_tensor,
                 "image_grid_thw" => image_grid_thw_tensor,
             }))?;
-            log_info(format!(
+            log_info(TAG, format!(
                 "vision_session.run finished (elapsed: {:.3}s)",
                 t_run.elapsed().as_secs_f64()
             ));
@@ -525,14 +498,14 @@ impl OcrBackend for OrtBackend {
                 .context("vision_encoder output is not 2D")?
                 .to_owned()
         };
-        log_info(format!("image_features shape={:?}", image_features.shape()));
-        log_stage_end(stage, stage_start);
+        log_info(TAG, format!("image_features shape={:?}", image_features.shape()));
+        log_stage_end(TAG, stage, stage_start);
 
         let stage = "Build prompt and text embeddings";
         let stage_start = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let prompt = build_prompt();
-        log_info(format!("Prompt length: {} chars", prompt.len()));
+        log_info(TAG, format!("Prompt length: {} chars", prompt.len()));
         let encoding = tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -542,7 +515,7 @@ impl OcrBackend for OrtBackend {
             .iter()
             .position(|&x| x == IMAGE_TOKEN_ID)
             .ok_or_else(|| anyhow!("<|image|> token ({IMAGE_TOKEN_ID}) not found in prompt"))?;
-        log_info(format!(
+        log_info(TAG, format!(
             "input_ids length={}, image_token position={}",
             input_ids.len(),
             image_pos
@@ -554,14 +527,14 @@ impl OcrBackend for OrtBackend {
             let embed_outputs = ok(embed_session.run(ort::inputs! {
                 "input_ids" => ok(Tensor::from_array(text_ids_array.clone()))?,
             }))?;
-            log_info(format!("Initial embed_session.run finished (elapsed: {:.3}s)", t.elapsed().as_secs_f64()));
+            log_info(TAG, format!("Initial embed_session.run finished (elapsed: {:.3}s)", t.elapsed().as_secs_f64()));
             ok(embed_outputs[0].try_extract_array::<f32>())?
                 .into_dimensionality::<Ix3>()
                 .context("embed_tokens output is not 3D")?
                 .to_owned()
         };
-        log_info(format!("text_embeds shape={:?}", text_embeds.shape()));
-        log_stage_end(stage, stage_start);
+        log_info(TAG, format!("text_embeds shape={:?}", text_embeds.shape()));
+        log_stage_end(TAG, stage, stage_start);
 
         let prefix = text_embeds.slice(s![0, 0..image_pos, ..]).to_owned();
         let suffix = text_embeds
@@ -570,7 +543,7 @@ impl OcrBackend for OrtBackend {
 
         let seq_len = prefix.shape()[0] + image_features.shape()[0] + suffix.shape()[0];
         let mut full_embeds = Array3::<f32>::zeros((1, seq_len, HIDDEN_SIZE));
-        log_info(format!(
+        log_info(TAG, format!(
             "prefix_len={}, image_feature_tokens={}, suffix_len={}, full_seq_len={}",
             prefix.shape()[0],
             image_features.shape()[0],
@@ -607,27 +580,23 @@ impl OcrBackend for OrtBackend {
             img_n,
             seq_len,
         )?;
-        log_info(format!("mRoPE delta = {}", mrope_position_delta));
+        log_info(TAG, format!("mRoPE delta = {}", mrope_position_delta));
 
         let mut past_kv: Vec<ArrayD<f32>> = (0..NUM_LAYERS * 2)
             .map(|_| ArrayD::<f32>::zeros(IxDyn(&[1, NUM_KV_HEADS, 0, HEAD_DIM])))
             .collect();
 
         let mut generated_ids: Vec<i64> = Vec::new();
-        log_stage_start("Autoregressive decode loop");
+        log_stage_start(TAG, "Autoregressive decode loop");
         let decode_stage_start = Instant::now();
         let verbose = is_verbose();
-        let stream_decode = if verbose {
-            std::env::var("OCR_STREAM_DECODE")
-                .ok()
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "off" || v == "no")
-                })
-                .unwrap_or(true)
-        } else {
-            true
-        };
+        let stream_decode = std::env::var("OCR_STREAM_DECODE")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
 
         // Pre-compute KV cache name strings to avoid format! per step
         let kv_names: Vec<(&'static str, &'static str)> = (0..NUM_LAYERS)
@@ -654,7 +623,7 @@ impl OcrBackend for OrtBackend {
                     let out = ok(embed_session.run(ort::inputs! {
                         "input_ids" => ok(TensorRef::from_array_view(ids.view()))?,
                     }))?;
-                    log_info(format!(
+                    log_info(TAG, format!(
                         "step={} incremental embed finished (elapsed: {:.3}s)",
                         step,
                         t.elapsed().as_secs_f64()
@@ -695,7 +664,7 @@ impl OcrBackend for OrtBackend {
             }
 
             if step < 5 || step % 10 == 0 {
-                log_info(format!(
+                log_info(TAG, format!(
                     "step={} preparing decoder_session.run, attention_total_len={}",
                     step, total_len
                 ));
@@ -703,7 +672,7 @@ impl OcrBackend for OrtBackend {
             let t = Instant::now();
             let outputs = ok(decoder_session.run(decoder_inputs))?;
             if step < 5 || step % 10 == 0 {
-                log_info(format!(
+                log_info(TAG, format!(
                     "step={} decoder_session.run finished (elapsed: {:.3}s)",
                     step,
                     t.elapsed().as_secs_f64()
@@ -718,7 +687,7 @@ impl OcrBackend for OrtBackend {
             let vocab_slice = logits_2d.index_axis(Axis(0), 0);
             let next = pick_next_token(vocab_slice.to_slice().unwrap_or(&[]), step);
             if step < 5 || step % 10 == 0 {
-                log_info(format!(
+                log_info(TAG, format!(
                     "step={} next_token_id={}, step_elapsed={:.3}s",
                     step,
                     next,
@@ -734,11 +703,7 @@ impl OcrBackend for OrtBackend {
                     .map_err(|e| anyhow!(e.to_string()))?;
                 if !piece.is_empty() {
                     if verbose {
-                        log_info(format!(
-                            "[STREAM] step={}, piece={}",
-                            step,
-                            piece.replace('\n', "\\n")
-                        ));
+                        log_stream(TAG, step, &piece);
                     } else {
                         print!("{}", piece);
                         let _ = std::io::stdout().flush();
@@ -747,7 +712,7 @@ impl OcrBackend for OrtBackend {
             }
 
             if EOS_TOKEN_IDS.contains(&next) {
-                log_info(format!("step={} hit EOS token={}, stopping decode early", step, next));
+                log_info(TAG, format!("step={} hit EOS token={}, stopping decode early", step, next));
                 break;
             }
 
@@ -760,16 +725,16 @@ impl OcrBackend for OrtBackend {
             std::mem::swap(&mut past_kv, &mut new_past);
             step += 1;
         }
-        log_stage_end("Autoregressive decode loop", decode_stage_start);
+        log_stage_end(TAG, "Autoregressive decode loop", decode_stage_start);
 
         let gen_u32: Vec<u32> = generated_ids.iter().map(|&x| x as u32).collect();
         let decoded = tokenizer
             .decode(&gen_u32, true)
             .map_err(|e| anyhow!(e.to_string()))?;
 
-        log_info(format!("Generated token count: {}", generated_ids.len()));
-        log_info(format!("Total elapsed: {:.3}s", total_start.elapsed().as_secs_f64()));
-        log_stage_end("GLM OCR ONNX Rust inference", total_start);
+        log_info(TAG, format!("Generated token count: {}", generated_ids.len()));
+        log_info(TAG, format!("Total elapsed: {:.3}s", total_start.elapsed().as_secs_f64()));
+        log_stage_end(TAG, "GLM OCR ONNX Rust inference", total_start);
 
         Ok(InferResult {
             text: decoded,

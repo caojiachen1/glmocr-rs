@@ -6,3 +6,4 @@ test*
 *.bat
 .*
 !.cargo
+!benchmark.bat

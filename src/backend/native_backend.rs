@@ -13,41 +13,14 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use rayon::ThreadPoolBuilder;
 
-use super::{OcrBackend, InferResult};
+use super::{OcrBackend, InferResult, is_verbose, log_info, log_stage_start, log_stage_end, log_stream};
 
+const TAG: &str = "NATIVE";
 const IMAGE_TOKEN_ID: i64 = 59280;
 const EOS_TOKEN_IDS: [i64; 2] = [59246, 59253];
 const PATCH_SIZE: usize = 14;
 const TEMPORAL_PATCH_SIZE: usize = 2;
 const MERGE_SIZE: usize = 2;
-
-fn log_info(message: impl AsRef<str>) {
-    if is_verbose() {
-        eprintln!("[OCR][NATIVE][INFO] {}", message.as_ref());
-    }
-}
-
-fn log_stage_start(stage: impl AsRef<str>) {
-    if is_verbose() {
-        eprintln!("[OCR][NATIVE][STAGE] >>> {}", stage.as_ref());
-    }
-}
-
-fn log_stage_end(stage: impl AsRef<str>, started_at: Instant) {
-    if is_verbose() {
-        eprintln!(
-            "[OCR][NATIVE][STAGE] <<< {} (elapsed: {:.3}s)",
-            stage.as_ref(),
-            started_at.elapsed().as_secs_f64()
-        );
-    }
-}
-
-fn is_verbose() -> bool {
-    let v = std::env::var("OCR_VERBOSE").unwrap_or_else(|_| "1".to_string());
-    let v = v.trim().to_ascii_lowercase();
-    !(v == "0" || v == "false" || v == "off" || v == "no")
-}
 
 /// Convert candle error to anyhow error - inline for performance
 #[inline(always)]
@@ -61,24 +34,24 @@ static RT_INIT: Once = Once::new();
 /// If force_cpu is true, always return CPU device
 fn get_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
-        log_info("CPU mode forced: using CPU device");
+        log_info(TAG, "CPU mode forced: using CPU device");
         return Ok(Device::Cpu);
     }
     
     if cuda_is_available() {
-        log_info("CUDA is available, using GPU device");
+        log_info(TAG, "CUDA is available, using GPU device");
         match Device::new_cuda(0) {
             Ok(device) => {
-                log_info(format!("CUDA device initialized: {:?}", device));
+                log_info(TAG, format!("CUDA device initialized: {:?}", device));
                 Ok(device)
             }
             Err(e) => {
-                log_info(format!("Failed to initialize CUDA device: {}, falling back to CPU", e));
+                log_info(TAG, format!("Failed to initialize CUDA device: {}, falling back to CPU", e));
                 Ok(Device::Cpu)
             }
         }
     } else {
-        log_info("CUDA is not available, using CPU device");
+        log_info(TAG, "CUDA is not available, using CPU device");
         Ok(Device::Cpu)
     }
 }
@@ -89,7 +62,7 @@ fn init_runtime() {
             let n = nz.get();
             let _ = std::env::set_var("RAYON_NUM_THREADS", n.to_string());
             let _ = ThreadPoolBuilder::new().num_threads(n).build_global();
-            log_info(format!("Initialized CPU thread pool: rayon_threads={}", n));
+            log_info(TAG, format!("Initialized CPU thread pool: rayon_threads={}", n));
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -99,7 +72,7 @@ fn init_runtime() {
             let fma = std::is_x86_feature_detected!("fma");
             let avx512f = std::is_x86_feature_detected!("avx512f");
             let bf16 = std::is_x86_feature_detected!("avx512bf16");
-            log_info(format!(
+            log_info(TAG, format!(
                 "CPU features: avx={}, avx2={}, fma={}, avx512f={}, avx512bf16={}",
                 avx, avx2, fma, avx512f, bf16
             )); 
@@ -673,20 +646,20 @@ struct SafetensorsModel {
 impl SafetensorsModel {
     fn load(model_root: &Path, force_cpu: bool) -> Result<Self> {
         let total_t = Instant::now();
-        log_stage_start("Load safetensors model");
+        log_stage_start(TAG, "Load safetensors model");
 
         let config_path = model_root.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
         let cfg: ModelConfig = serde_json::from_str(&config_str).context("Failed to parse config.json")?;
-        log_info(format!("Config loaded: {}", config_path.display()));
+        log_info(TAG, format!("Config loaded: {}", config_path.display()));
 
         let weights_path = model_root.join("model.safetensors");
         let device = get_device(force_cpu)?;
-        log_info(format!("Loading weights: {}", weights_path.display()));
+        log_info(TAG, format!("Loading weights: {}", weights_path.display()));
         let tensors = c(candle_core::safetensors::load(&weights_path, &device))
             .with_context(|| format!("Failed to load safetensors: {}", weights_path.display()))?;
-        log_info(format!("Weights loaded, total tensors: {}", tensors.len()));
+        log_info(TAG, format!("Weights loaded, total tensors: {}", tensors.len()));
 
         // Helper closures for loading weights
         let get_required_f32 = |name: &str| -> Result<Tensor> {
@@ -785,7 +758,7 @@ impl SafetensorsModel {
 
         let kv_repeat = cfg.text_config.num_attention_heads / cfg.text_config.num_key_value_heads;
 
-        log_stage_end("Load safetensors model", total_t);
+        log_stage_end(TAG, "Load safetensors model", total_t);
 
         Ok(Self {
             cfg,
@@ -839,7 +812,7 @@ impl SafetensorsModel {
         let vw = &self.vision;
         let dev = &self.device;
         
-        log_info(format!(
+        log_info(TAG, format!(
             "vision_forward: num_patches={}, hidden_size={}, depth={}",
             pixel_values.shape()[0],
             vt.hidden_size,
@@ -986,7 +959,7 @@ impl SafetensorsModel {
             hidden = c(&h1 + &mlp)?;
 
             if layer < 2 || layer + 1 == vt.depth || (layer + 1) % 4 == 0 {
-                log_info(format!(
+                log_info(TAG, format!(
                     "vision block progress: {}/{} (layer elapsed: {:.3}s)",
                     layer + 1,
                     vt.depth,
@@ -1193,10 +1166,10 @@ impl OcrBackend for NativeBackend {
     ) -> Result<InferResult> {
         init_runtime();
         if cfg!(debug_assertions) {
-            log_info("Debug build detected; CPU inference can be much slower. Consider running `cargo run --release`");
+            log_info(TAG, "Debug build detected; CPU inference can be much slower. Consider running `cargo run --release`");
         }
         let total_t = Instant::now();
-        log_stage_start("safetensors OCR inference");
+        log_stage_start(TAG, "safetensors OCR inference");
 
         let (tokenizer_path, config_path, weights_path) = Self::model_paths(model_root);
         for p in [&tokenizer_path, &config_path, &weights_path] {
@@ -1204,19 +1177,19 @@ impl OcrBackend for NativeBackend {
                 bail!("Missing file: {}", p.display());
             }
         }
-        log_info("File check passed: tokenizer + config + safetensors all exist");
+        log_info(TAG, "File check passed: tokenizer + config + safetensors all exist");
 
         let stage = "Load tokenizer";
         let stage_t = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!(e.to_string()))?;
-        log_stage_end(stage, stage_t);
+        log_stage_end(TAG, stage, stage_t);
 
         let stage = "Load safetensors weights";
         let stage_t = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let model = SafetensorsModel::load(model_root, self.force_cpu)?;
-        log_stage_end(stage, stage_t);
+        log_stage_end(TAG, stage, stage_t);
         if model.cfg.image_token_id != IMAGE_TOKEN_ID {
             bail!(
                 "image_token_id mismatch: config={}, code={}",
@@ -1227,16 +1200,16 @@ impl OcrBackend for NativeBackend {
 
         let stage = "Image preprocessing + vision encoding";
         let stage_t = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let (pixel_values, image_grid_thw) = preprocess_image(image_path, min_pixels, max_pixels)?;
         let image_features = model.vision_forward(&pixel_values, &image_grid_thw)?;
         let img_tokens = image_features.dim(0).map_err(|e| anyhow!(e.to_string()))?;
-        log_info(format!("Vision feature token count: {}", img_tokens));
-        log_stage_end(stage, stage_t);
+        log_info(TAG, format!("Vision feature token count: {}", img_tokens));
+        log_stage_end(TAG, stage, stage_t);
 
         let stage = "Build prompt and prefill";
         let stage_t = Instant::now();
-        log_stage_start(stage);
+        log_stage_start(TAG, stage);
         let prompt = build_prompt();
         let encoding = tokenizer
             .encode(prompt, false)
@@ -1276,31 +1249,27 @@ impl OcrBackend for NativeBackend {
         let mut generated: Vec<i64> = Vec::new();
         let first_logits = last.to_vec1::<f32>().map_err(|e| anyhow!(e.to_string()))?;
         generated.push(pick_next_token(&first_logits));
-        log_stage_end(stage, stage_t);
+        log_stage_end(TAG, stage, stage_t);
 
         let max_new_tokens = std::env::var("OCR_MAX_NEW_TOKENS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         
         match max_new_tokens {
-            Some(limit) => log_info(format!("Maximum new decode tokens: {}", limit)),
-            None => log_info("Maximum new decode tokens: unlimited (will stop on EOS)"),
+            Some(limit) => log_info(TAG, format!("Maximum new decode tokens: {}", limit)),
+            None => log_info(TAG, "Maximum new decode tokens: unlimited (will stop on EOS)"),
         }
 
         let decode_t = Instant::now();
-        log_stage_start("Autoregressive decode");
+        log_stage_start(TAG, "Autoregressive decode");
         let verbose = is_verbose();
-        let stream_decode = if verbose {
-            std::env::var("OCR_STREAM_DECODE")
-                .ok()
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "off" || v == "no")
-                })
-                .unwrap_or(true)
-        } else {
-            true
-        };
+        let stream_decode = std::env::var("OCR_STREAM_DECODE")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
 
         if stream_decode {
             let first_tok = *generated.first().unwrap_or(&EOS_TOKEN_IDS[0]);
@@ -1310,10 +1279,7 @@ impl OcrBackend for NativeBackend {
                     .map_err(|e| anyhow!(e.to_string()))?;
                 if !piece.is_empty() {
                     if verbose {
-                        eprintln!(
-                            "[OCR][NATIVE][STREAM] step=prefill, piece={}",
-                            piece.replace('\n', "\\n")
-                        );
+                        log_stream(TAG, 0, &piece);
                     } else {
                         print!("{}", piece);
                         let _ = std::io::stdout().flush();
@@ -1332,7 +1298,7 @@ impl OcrBackend for NativeBackend {
             // 如果设置了最大token数限制则检查
             if let Some(limit) = max_new_tokens {
                 if step >= limit {
-                    log_info(format!("Reached maximum token limit: {}, stopping generation", limit));
+                    log_info(TAG, format!("Reached maximum token limit: {}, stopping generation", limit));
                     break;
                 }
             }
@@ -1356,11 +1322,7 @@ impl OcrBackend for NativeBackend {
                     .map_err(|e| anyhow!(e.to_string()))?;
                 if !piece.is_empty() {
                     if verbose {
-                        eprintln!(
-                            "[OCR][NATIVE][STREAM] step={}, piece={}",
-                            step,
-                            piece.replace('\n', "\\n")
-                        );
+                        log_stream(TAG, step, &piece);
                     } else {
                         print!("{}", piece);
                         let _ = std::io::stdout().flush();
@@ -1369,7 +1331,7 @@ impl OcrBackend for NativeBackend {
             }
 
             if step < 5 || step % 16 == 0 {
-                log_info(format!(
+                log_info(TAG, format!(
                     "decode progress: step={}, token={}, generated={}",
                     step,
                     tok,
@@ -1382,15 +1344,15 @@ impl OcrBackend for NativeBackend {
             
             step += 1;
         }
-        log_stage_end("Autoregressive decode", decode_t);
+        log_stage_end(TAG, "Autoregressive decode", decode_t);
 
         let gen_u32: Vec<u32> = generated.iter().map(|&x| x as u32).collect();
         let decoded = tokenizer
             .decode(&gen_u32, true)
             .map_err(|e| anyhow!(e.to_string()))?;
 
-        log_info(format!("Inference finished, elapsed {:.3}s", total_t.elapsed().as_secs_f64()));
-        log_stage_end("safetensors OCR inference", total_t);
+        log_info(TAG, format!("Inference finished, elapsed {:.3}s", total_t.elapsed().as_secs_f64()));
+        log_stage_end(TAG, "safetensors OCR inference", total_t);
         Ok(InferResult {
             text: decoded,
             token_count: generated.len(),
