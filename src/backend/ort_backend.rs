@@ -8,7 +8,7 @@ use ndarray::{s, Array, Array2, Array3, Array4, ArrayD, Axis, Ix2, Ix3, IxDyn};
 use ort::{
     ep::{get_gpu_device, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider},
     session::{Session, SessionInputValue},
-    value::Tensor,
+    value::{Tensor, TensorRef},
 };
 use tokenizers::Tokenizer;
 
@@ -629,7 +629,19 @@ impl OcrBackend for OrtBackend {
             true
         };
 
+        // Pre-compute KV cache name strings to avoid format! per step
+        let kv_names: Vec<(&'static str, &'static str)> = (0..NUM_LAYERS)
+            .map(|i| {
+                let k: &'static str = Box::leak(format!("past_key_values.{i}.key").into_boxed_str());
+                let v: &'static str = Box::leak(format!("past_key_values.{i}.value").into_boxed_str());
+                (k, v)
+            })
+            .collect();
+
         let mut step = 0usize;
+        let mut past_len = 0usize;
+        let mut new_past = Vec::<ArrayD<f32>>::with_capacity(NUM_LAYERS * 2);
+
         loop {
             let step_start = Instant::now();
             let (current_embeds, current_position_ids) = if step == 0 {
@@ -640,7 +652,7 @@ impl OcrBackend for OrtBackend {
                 let embed = {
                     let t = Instant::now();
                     let out = ok(embed_session.run(ort::inputs! {
-                        "input_ids" => ok(Tensor::from_array(ids.clone()))?,
+                        "input_ids" => ok(TensorRef::from_array_view(ids.view()))?,
                     }))?;
                     log_info(format!(
                         "step={} incremental embed finished (elapsed: {:.3}s)",
@@ -653,11 +665,7 @@ impl OcrBackend for OrtBackend {
                         .to_owned()
                 };
 
-                let pos = past_kv
-                    .first()
-                    .and_then(|kv| kv.shape().get(2).copied())
-                    .unwrap_or(0) as i64
-                    + mrope_position_delta;
+                let pos = past_len as i64 + mrope_position_delta;
                 let mut p = Array3::<i64>::zeros((3, 1, 1));
                 p[[0, 0, 0]] = pos;
                 p[[1, 0, 0]] = pos;
@@ -665,7 +673,7 @@ impl OcrBackend for OrtBackend {
                 (embed, p)
             };
 
-            let past_len = past_kv
+            past_len = past_kv
                 .first()
                 .and_then(|kv| kv.shape().get(2).copied())
                 .unwrap_or(0);
@@ -673,24 +681,17 @@ impl OcrBackend for OrtBackend {
             let attention_mask = Array2::<i64>::ones((1, total_len));
             let num_logits_to_keep = Array::from_shape_vec(IxDyn(&[]), vec![1i64])?;
 
+            // TensorRef::from_array_view — zero-copy view, eliminates deep-copy per tensor
             let mut decoder_inputs: Vec<(std::borrow::Cow<'_, str>, SessionInputValue<'_>)> = ort::inputs! {
-                "inputs_embeds" => ok(Tensor::from_array(current_embeds.clone()))?,
-                "attention_mask" => ok(Tensor::from_array(attention_mask.clone()))?,
-                "position_ids" => ok(Tensor::from_array(current_position_ids.clone()))?,
-                "num_logits_to_keep" => ok(Tensor::from_array(num_logits_to_keep.clone()))?,
+                "inputs_embeds" => ok(TensorRef::from_array_view(current_embeds.view()))?,
+                "attention_mask" => ok(TensorRef::from_array_view(attention_mask.view()))?,
+                "position_ids" => ok(TensorRef::from_array_view(current_position_ids.view()))?,
+                "num_logits_to_keep" => ok(TensorRef::from_array_view(num_logits_to_keep.view()))?,
             };
 
             for i in 0..NUM_LAYERS {
-                let k_name = format!("past_key_values.{i}.key");
-                let v_name = format!("past_key_values.{i}.value");
-                decoder_inputs.push((
-                    k_name.into(),
-                    ok(Tensor::from_array(past_kv[2 * i].clone()))?.into(),
-                ));
-                decoder_inputs.push((
-                    v_name.into(),
-                    ok(Tensor::from_array(past_kv[2 * i + 1].clone()))?.into(),
-                ));
+                decoder_inputs.push((kv_names[i].0.into(), ok(TensorRef::from_array_view(past_kv[2 * i].view()))?.into()));
+                decoder_inputs.push((kv_names[i].1.into(), ok(TensorRef::from_array_view(past_kv[2 * i + 1].view()))?.into()));
             }
 
             if step < 5 || step % 10 == 0 {
@@ -709,13 +710,13 @@ impl OcrBackend for OrtBackend {
                 ));
             }
 
-            let logits = ok(outputs[0].try_extract_array::<f32>())?
+            // Use view for logits — avoids allocating ~260KB each step
+            let logits_view = ok(outputs[0].try_extract_array::<f32>())?
                 .into_dimensionality::<Ix3>()
-                .context("Decoder logits output is not 3D")?
-                .to_owned();
-
-            let vocab_slice = logits.index_axis(Axis(0), 0).index_axis(Axis(0), 0).to_owned();
-            let next = pick_next_token(vocab_slice.as_slice().unwrap_or(&[]), step);
+                .context("Decoder logits output is not 3D")?;
+            let logits_2d = logits_view.index_axis(Axis(0), 0);
+            let vocab_slice = logits_2d.index_axis(Axis(0), 0);
+            let next = pick_next_token(vocab_slice.to_slice().unwrap_or(&[]), step);
             if step < 5 || step % 10 == 0 {
                 log_info(format!(
                     "step={} next_token_id={}, step_elapsed={:.3}s",
@@ -750,12 +751,13 @@ impl OcrBackend for OrtBackend {
                 break;
             }
 
-            let mut new_past = Vec::<ArrayD<f32>>::with_capacity(NUM_LAYERS * 2);
+            // Reuse pre-allocated Vec — avoids new allocation each step
+            new_past.clear();
             for i in 0..(NUM_LAYERS * 2) {
                 let t = ok(outputs[i + 1].try_extract_array::<f32>())?.to_owned();
                 new_past.push(t);
             }
-            past_kv = new_past;
+            std::mem::swap(&mut past_kv, &mut new_past);
             step += 1;
         }
         log_stage_end("Autoregressive decode loop", decode_stage_start);
