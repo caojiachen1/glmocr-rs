@@ -355,19 +355,30 @@ fn pick_next_token(logits: &[f32], step: usize) -> i64 {
         return EOS_TOKEN_IDS[0];
     }
 
-    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
+    // O(n) argmax instead of O(n log n) sort
     if step < 5 {
-        for (idx, _) in &pairs {
-            let token = *idx as i64;
-            if !EOS_TOKEN_IDS.contains(&token) {
-                return token;
+        // For early steps, skip EOS tokens to avoid premature stopping
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &val) in logits.iter().enumerate() {
+            let token = idx as i64;
+            if val > best_val && !EOS_TOKEN_IDS.contains(&token) {
+                best_val = val;
+                best_idx = idx;
             }
+        }
+        if best_val > f32::NEG_INFINITY {
+            return best_idx as i64;
         }
     }
 
-    pairs.first().map(|(idx, _)| *idx as i64).unwrap_or(EOS_TOKEN_IDS[0])
+    // Standard argmax
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx as i64)
+        .unwrap_or(EOS_TOKEN_IDS[0])
 }
 
 pub struct OrtBackend {

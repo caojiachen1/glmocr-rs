@@ -176,12 +176,13 @@ fn preprocess_image(
     const IMAGE_MEAN: [f32; 3] = [0.48145466f32, 0.4578275f32, 0.40821073f32];
     const IMAGE_STD: [f32; 3] = [0.26862954f32, 0.26130258f32, 0.27577711f32];
 
-    // Optimized pixel normalization
+    // Optimized pixel normalization - iterate y,x then c for better cache locality
+    // and reduce get_pixel calls by processing all 3 channels per pixel
     let mut chw = Array3::<f32>::zeros((3, target_h, target_w));
-    for c in 0..3 {
-        for y in 0..target_h {
-            for x in 0..target_w {
-                let p = resized.get_pixel(x as u32, y as u32).0;
+    for y in 0..target_h {
+        for x in 0..target_w {
+            let p = resized.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
                 let v = p[c] as f32 / 255.0;
                 chw[[c, y, x]] = (v - IMAGE_MEAN[c]) / IMAGE_STD[c];
             }
@@ -518,8 +519,7 @@ fn causal_mask(device: &Device, q_len: usize, k_len: usize, past: usize) -> Resu
     c(Tensor::from_vec(v, (1, 1, q_len, k_len), device))
 }
 
-/// Optimized grouped KV attention - inspired by vllm.rs
-/// Reduces clones, uses more efficient tensor operations
+/// Optimized grouped KV attention - per-head loop with minimal allocations
 fn attention_grouped_kv(
     q: &Tensor,
     k: &Tensor,
@@ -528,52 +528,28 @@ fn attention_grouped_kv(
     scale: f64,
     mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    let (b, n_heads, _q_len, head_dim) = q.dims4().map_err(|e| anyhow!(e.to_string()))?;
-    let (bk, n_kv_heads, k_len, k_head_dim) = k.dims4().map_err(|e| anyhow!(e.to_string()))?;
-    let (_, n_kv_heads_v, v_len, v_head_dim) = v.dims4().map_err(|e| anyhow!(e.to_string()))?;
+    let (b, _n_heads, _q_len, head_dim) = q.dims4().map_err(|e| anyhow!(e.to_string()))?;
+    let (_, n_kv_heads, k_len, _k_dim) = k.dims4().map_err(|e| anyhow!(e.to_string()))?;
 
-    if b != bk || n_kv_heads != n_kv_heads_v || k_len != v_len || head_dim != k_head_dim || head_dim != v_head_dim {
-        bail!(
-            "attention_grouped_kv dimension mismatch: q={:?}, k={:?}, v={:?}",
-            q.dims(),
-            k.dims(),
-            v.dims()
-        );
-    }
-    if n_heads != n_kv_heads * kv_repeat {
-        bail!(
-            "attention_grouped_kv head count mismatch: n_heads={} != n_kv_heads({})*kv_repeat({})",
-            n_heads,
-            n_kv_heads,
-            kv_repeat
-        );
-    }
-
-    // Process each KV head group
     let mut parts = Vec::<Tensor>::with_capacity(n_kv_heads);
     for kvh in 0..n_kv_heads {
         let h_start = kvh * kv_repeat;
-        
-        // Extract q group - avoid unnecessary contiguous when possible
         let q_g = c(q.narrow(1, h_start, kv_repeat))?;
         let k_g = c(k.narrow(1, kvh, 1))?;
         let v_g = c(v.narrow(1, kvh, 1))?;
-        
-        // Broadcast k and v to match q's head count, ensure contiguous for CUDA matmul
-        let k_g = c(c(k_g.broadcast_as((b, kv_repeat, k_len, head_dim)))?.contiguous())?;
-        let v_g = c(c(v_g.broadcast_as((b, kv_repeat, v_len, head_dim)))?.contiguous())?;
 
-        // Compute attention scores
-        let k_t = c(c(k_g.transpose(2, 3))?.contiguous())?;
-        let mut scores = c(c(q_g.matmul(&k_t))? * scale)?;
-        
+        let k_g = c(k_g.broadcast_as((b, kv_repeat, k_len, head_dim))?.contiguous())?;
+        let v_g = c(v_g.broadcast_as((b, kv_repeat, k_len, head_dim))?.contiguous())?;
+
+        let k_t = c(k_g.transpose(2, 3))?;
+        let mut scores = c(q_g.matmul(&k_t)? * scale)?;
+
         if let Some(attn_mask) = mask {
             scores = c(scores.broadcast_add(attn_mask))?;
         }
 
         let probs = ops::softmax_last_dim(&scores).map_err(|e| anyhow!(e.to_string()))?;
-        let ctx_g = c(probs.matmul(&v_g))?;
-        parts.push(ctx_g);
+        parts.push(c(probs.matmul(&v_g))?);
     }
 
     let part_refs: Vec<&Tensor> = parts.iter().collect();
@@ -870,23 +846,39 @@ impl SafetensorsModel {
             }
         }
 
-        // Build cos/sin tables
+        // Pre-compute cos/sin per unique grid position to avoid redundant trig calls
+        let mut grid_cos = vec![0f32; max_grid * inv_len];
+        let mut grid_sin = vec![0f32; max_grid * inv_len];
+        for p in 0..max_grid {
+            let base = p * inv_len;
+            for j in 0..inv_len {
+                let v = table[base + j];
+                grid_cos[base + j] = v.cos();
+                grid_sin[base + j] = v.sin();
+            }
+        }
+
+        // Build cos/sin tables using pre-computed lookup
+        let half = head_dim / 2;
         let mut cos = vec![0f32; seq * head_dim];
         let mut sin = vec![0f32; seq * head_dim];
         for i in 0..seq {
             let base = i * head_dim;
+            let h_base = h_pos[i] * inv_len;
+            let w_base = w_pos[i] * inv_len;
             for j in 0..inv_len {
-                let hv = table[h_pos[i] * inv_len + j];
-                let wv = table[w_pos[i] * inv_len + j];
-                cos[base + j] = hv.cos();
-                cos[base + inv_len + j] = wv.cos();
-                sin[base + j] = hv.sin();
-                sin[base + inv_len + j] = wv.sin();
-                // duplicate for full head_dim
-                cos[base + head_dim / 2 + j] = hv.cos();
-                cos[base + head_dim / 2 + inv_len + j] = wv.cos();
-                sin[base + head_dim / 2 + j] = hv.sin();
-                sin[base + head_dim / 2 + inv_len + j] = wv.sin();
+                let hc = grid_cos[h_base + j];
+                let hs = grid_sin[h_base + j];
+                let wc = grid_cos[w_base + j];
+                let ws = grid_sin[w_base + j];
+                cos[base + j] = hc;
+                cos[base + inv_len + j] = wc;
+                sin[base + j] = hs;
+                sin[base + inv_len + j] = ws;
+                cos[base + half + j] = hc;
+                cos[base + half + inv_len + j] = wc;
+                sin[base + half + j] = hs;
+                sin[base + half + inv_len + j] = ws;
             }
         }
         
@@ -1003,7 +995,7 @@ impl SafetensorsModel {
         if b != 1 {
             bail!("Only batch=1 is currently supported");
         }
-        
+
         let mut h = inputs_embeds.clone();
         let (cos, sin) = compute_text_cos_sin(tc, position_ids)?;
         let scale = 1.0 / (tc.head_dim as f64).sqrt();
@@ -1035,8 +1027,8 @@ impl SafetensorsModel {
             // Compute attention with causal mask
             let mask = causal_mask(&self.device, seq, seq, 0)?;
             let ctx = attention_grouped_kv(&q, &k, &v, self.kv_repeat, scale, Some(&mask))?;
-            
-            // Reshape and project
+
+            // Reshape: [b, heads, seq, dim] -> [b, seq, heads*dim]
             let ctx = c(c(c(ctx.transpose(1, 2))?.contiguous())?.reshape((1, seq, tc.num_attention_heads * tc.head_dim)))?;
             let attn = linear(&ctx, &lw.o_w, None)?;
             let attn = rms_norm(&attn, &lw.psa_ln, tc.rms_norm_eps)?;
