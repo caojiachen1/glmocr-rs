@@ -7,6 +7,8 @@ use anyhow::{anyhow, bail, Result};
 mod backend;
 
 use backend::{ort_backend::OrtBackend, native_backend::NativeBackend, OcrBackend, log_info};
+#[cfg(feature = "gguf")]
+use backend::gguf_backend::GgufBackend;
 
 const DEFAULT_MIN_PIXELS: usize = 12_544;
 const DEFAULT_MAX_PIXELS: usize = 1_048_576;
@@ -15,6 +17,8 @@ const DEFAULT_MAX_PIXELS: usize = 1_048_576;
 enum BackendChoice {
     Onnx,
     Native,
+    #[cfg(feature = "gguf")]
+    Gguf,
 }
 
 impl BackendChoice {
@@ -22,6 +26,8 @@ impl BackendChoice {
         match self {
             Self::Onnx => PathBuf::from("GLM-OCR-ONNX"),
             Self::Native => PathBuf::from("GLM-OCR"),
+            #[cfg(feature = "gguf")]
+            Self::Gguf => PathBuf::from("GLM-OCR-GGUF"),
         }
     }
 
@@ -29,6 +35,8 @@ impl BackendChoice {
         match self {
             Self::Onnx => "onnx",
             Self::Native => "native",
+            #[cfg(feature = "gguf")]
+            Self::Gguf => "gguf",
         }
     }
 
@@ -37,6 +45,8 @@ impl BackendChoice {
         match normalized.as_str() {
             "onnx" | "ort" => Some(Self::Onnx),
             "native" | "nat" | "n" => Some(Self::Native),
+            #[cfg(feature = "gguf")]
+            "gguf" | "llama" | "ggml" => Some(Self::Gguf),
             _ => None,
         }
     }
@@ -52,14 +62,23 @@ fn read_env_usize(name: &str, default: usize) -> usize {
 fn print_help(binary: &str) {
     println!("GLM OCR Rust Inference");
     println!();
+    #[cfg(feature = "gguf")]
     println!("Usage:");
+    #[cfg(feature = "gguf")]
+    println!("  {binary} [--backend <onnx|native|gguf>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    #[cfg(not(feature = "gguf"))]
+    println!("Usage:");
+    #[cfg(not(feature = "gguf"))]
     println!("  {binary} [--backend <onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
     println!();
     println!("Arguments:");
+    #[cfg(feature = "gguf")]
+    println!("  -b, --backend <name>   Select inference backend (onnx | native | gguf)");
+    #[cfg(not(feature = "gguf"))]
     println!("  -b, --backend <name>   Select inference backend (onnx | native)");
     println!("  -m, --model <path>     Model root path");
     println!("  -i, --image <path>     Input image path");
-    println!("      --cpu              Force CPU mode (all backends: ONNX CPU-only, Native CPU-only)");
+    println!("      --cpu              Force CPU mode (all backends: ONNX CPU-only, Native CPU-only, GGUF CPU-only)");
     println!("      --onnx-quantized   Use quantized ONNX model files (*_quantized.onnx)");
     println!("      --timing           Print structured timing data to stdout (ELAPSED=... TOKENS=...)");
     println!("  -v, --verbose          Enable verbose logs (default)");
@@ -102,7 +121,10 @@ fn parse_cli_options() -> Result<CliOptions> {
             }
             "-b" | "--backend" => {
                 let v = args.next().ok_or_else(|| {
-                    anyhow!("Missing value for {arg}; allowed values: onnx | native")
+                    #[cfg(feature = "gguf")]
+                    { anyhow!("Missing value for {arg}; allowed values: onnx | native | gguf") }
+                    #[cfg(not(feature = "gguf"))]
+                    { anyhow!("Missing value for {arg}; allowed values: onnx | native") }
                 })?;
                 cli_backend = Some(v);
             }
@@ -142,7 +164,10 @@ fn parse_cli_options() -> Result<CliOptions> {
             _ if arg.starts_with("--backend=") => {
                 let v = arg.trim_start_matches("--backend=").trim().to_string();
                 if v.is_empty() {
-                    bail!("Missing value for --backend=; allowed values: onnx | native");
+                    #[cfg(feature = "gguf")]
+                    { bail!("Missing value for --backend=; allowed values: onnx | native | gguf"); }
+                    #[cfg(not(feature = "gguf"))]
+                    { bail!("Missing value for --backend=; allowed values: onnx | native"); }
                 }
                 cli_backend = Some(v);
             }
@@ -200,12 +225,18 @@ fn parse_cli_options() -> Result<CliOptions> {
 
     let (backend, backend_source) = if let Some(v) = cli_backend {
         let backend = BackendChoice::parse(&v).ok_or_else(|| {
-            anyhow!("Unsupported backend: {v}; allowed values: onnx | native")
+            #[cfg(feature = "gguf")]
+            { anyhow!("Unsupported backend: {v}; allowed values: onnx | native | gguf") }
+            #[cfg(not(feature = "gguf"))]
+            { anyhow!("Unsupported backend: {v}; allowed values: onnx | native") }
         })?;
         (backend, "CLI(--backend)")
     } else if let Ok(v) = std::env::var("OCR_BACKEND") {
         let backend = BackendChoice::parse(&v).ok_or_else(|| {
-            anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: onnx | native")
+            #[cfg(feature = "gguf")]
+            { anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: onnx | native | gguf") }
+            #[cfg(not(feature = "gguf"))]
+            { anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: onnx | native") }
         })?;
         (backend, "ENV(OCR_BACKEND)")
     } else {
@@ -329,6 +360,8 @@ fn main() -> Result<()> {
     let mut backend: Box<dyn OcrBackend> = match opts.backend {
         BackendChoice::Onnx => Box::new(OrtBackend::new(opts.cpu, opts.onnx_quantized)),
         BackendChoice::Native => Box::new(NativeBackend::new(opts.cpu)),
+        #[cfg(feature = "gguf")]
+        BackendChoice::Gguf => Box::new(GgufBackend::new(opts.cpu)),
     };
     if verbose {
         log_info("MAIN", format!("Active backend: {}", backend.name()));
