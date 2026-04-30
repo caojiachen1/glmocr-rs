@@ -1,5 +1,5 @@
 [package]
-name = "glm_ocr_onnx_rust"
+name = "glmocr_rs"
 version = "0.1.0"
 edition = "2021"
 

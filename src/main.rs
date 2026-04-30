@@ -104,7 +104,7 @@ struct CliOptions {
 
 fn parse_cli_options() -> Result<CliOptions> {
     let mut args = std::env::args();
-    let binary = args.next().unwrap_or_else(|| "glm_ocr_onnx_rust".to_string());
+    let binary = args.next().unwrap_or_else(|| "glmocr_rs".to_string());
     let mut cli_backend: Option<String> = None;
     let mut cli_model_root: Option<String> = None;
     let mut cli_image: Option<String> = None;

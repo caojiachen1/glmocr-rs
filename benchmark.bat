@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 set RUNS=5
 set BACKEND=
 set IMAGE=test.png
-set EXE=target\release\glm_ocr_onnx_rust.exe
+set EXE=target\release\glmocr_rs.exe
 set TMPF=%TEMP%\bench_out.txt
 
 :parse_args
