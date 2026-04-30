@@ -85,13 +85,17 @@ fn init_llama(text_model_path: &Path, mmproj_path: &Path, force_cpu: bool) -> Re
     cparams.n_threads_batch = n_threads;
     cparams.flash_attn_type = if force_cpu { LlamaFlashAttnType::Disabled } else { LlamaFlashAttnType::Enabled };
     cparams.offload_kqv = !force_cpu;
-    cparams.type_k = GgmlType::Q8_0;
-    cparams.type_v = GgmlType::Q8_0;
+    // KV cache quantization (Q8_0) requires flash attention — disable on CPU
+    if !force_cpu {
+        cparams.type_k = GgmlType::Q8_0;
+        cparams.type_v = GgmlType::Q8_0;
+    }
     cparams.no_perf = false;
     cparams.op_offload = !force_cpu;
 
     log_info(TAG, format!(
-        "Context: n_ctx={}, n_batch={}, n_ubatch={}, flash_attn={}, offload_kqv={}, type_k/v=Q8_0, threads={}",
+        "Context: n_ctx={}, n_batch={}, n_ubatch={}, flash_attn={}, offload_kqv={}, type_k/v={}, threads={}",
+        if force_cpu { "default" } else { "Q8_0" },
         cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, !force_cpu, !force_cpu, n_threads
     ));
 
