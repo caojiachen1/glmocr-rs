@@ -57,6 +57,14 @@ impl BackendChoice {
     }
 }
 
+#[inline]
+fn default_backend() -> (BackendChoice, &'static str) {
+    #[cfg(feature = "gguf")]
+    { (BackendChoice::Gguf, "DEFAULT") }
+    #[cfg(not(feature = "gguf"))]
+    { (BackendChoice::Onnx, "DEFAULT") }
+}
+
 fn read_env_usize(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(v) => v.parse::<usize>().unwrap_or(default),
@@ -245,7 +253,7 @@ fn parse_cli_options() -> Result<CliOptions> {
         })?;
         (backend, "ENV(OCR_BACKEND)")
     } else {
-        (BackendChoice::Onnx, "DEFAULT")
+        default_backend()
     };
 
     let (model_root, model_source) = if let Some(v) = cli_model_root {

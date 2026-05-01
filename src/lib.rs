@@ -84,8 +84,14 @@ pub struct OcrConfig {
 impl Default for OcrConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "gguf")]
+            model_root: PathBuf::from("GLM-OCR-GGUF"),
+            #[cfg(not(feature = "gguf"))]
             model_root: PathBuf::from("GLM-OCR-ONNX"),
             image_path: PathBuf::from("test.png"),
+            #[cfg(feature = "gguf")]
+            backend: BackendType::Gguf,
+            #[cfg(not(feature = "gguf"))]
             backend: BackendType::Onnx,
             cpu: false,
             onnx_quantized: false,
