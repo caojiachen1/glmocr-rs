@@ -1,86 +1,92 @@
-# GLM OCR ONNX Rust Inference
+# GLM OCR Rust
 
-This project provides a Rust OCR pipeline for GLM-OCR with two backends:
+Rust inference for GLM-OCR, powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) GGUF backend with full CUDA optimization.
 
-- `onnx` (default)
-- `native` (safetensors + Candle)
+## Quick Start
+
+```bash
+# Clone with submodule
+git clone --recurse-submodules https://github.com/caojiachen1/glmocr_rs.git
+cd glmocr_rs
+
+# Place GGUF models in GLM-OCR-GGUF/ (GLM-OCR-Q8_0.gguf + mmproj-GLM-OCR-Q8_0.gguf)
+# Place a test image as test.png
+
+# Run (default: gguf backend, GPU)
+cargo run --release
+
+# CPU mode
+cargo run --release -- --cpu
+
+# Other backends
+cargo run --release -- --backend onnx
+cargo run --release -- --backend native
+```
+
+## CLI
+
+```
+glmocr_rs [--backend <gguf|onnx|native>] [--model <path>] [--image <path>]
+          [--cpu] [--timing] [--verbose|--no-verbose]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-b, --backend` | `gguf` | Inference backend |
+| `-m, --model` | auto | Model root path |
+| `-i, --image` | `test.png` | Input image |
+| `--cpu` | off | Force CPU-only inference |
+| `--timing` | off | Output `ELAPSED=... TOKENS=...` |
+| `-v, --verbose` | on | Progress and timing logs |
+
+## Crate API
+
+```toml
+[dependencies]
+glmocr_rs = { git = "https://github.com/caojiachen1/glmocr_rs" }
+```
+
+```rust
+use glmocr_rs::{recognize, OcrConfig, BackendType};
+
+// Simple — uses gguf GPU backend by default
+let result = recognize(&OcrConfig {
+    image_path: "scan.png".into(),
+    ..Default::default()
+})?;
+println!("{}", result.text);
+
+// Custom backend
+let result = recognize(&OcrConfig {
+    model_root: "GLM-OCR-GGUF".into(),
+    image_path: "scan.png".into(),
+    backend: BackendType::Gguf,
+    cpu: false,
+    ..Default::default()
+})?;
+```
+
+### API Overview
+
+| Export | Description |
+|--------|-------------|
+| `recognize(config)` | One-shot OCR inference |
+| `create_backend(config)` | Create backend instance for reuse |
+| `OcrConfig` | Configuration struct (`Default` available) |
+| `BackendType` | `Gguf` / `Onnx` / `Native` |
+| `OcrBackend` | Trait for custom backends |
+| `InferResult` | `{ text, token_count }` |
+
+## Model Setup
+
+| Backend | Directory | Files |
+|---------|-----------|-------|
+| gguf (default) | `GLM-OCR-GGUF/` | `GLM-OCR-Q8_0.gguf`, `mmproj-GLM-OCR-Q8_0.gguf` |
+| native | `GLM-OCR/` | `model.safetensors`, `tokenizer.json`, `*.json` |
+| onnx | `GLM-OCR-ONNX/` | `onnx/*.onnx`, `tokenizer.json` |
 
 ## Features
 
-- Image preprocessing in Rust (resize + normalize + patchify)
-- ONNX Runtime backend using:
-  - `GLM-OCR-ONNX/onnx/vision_encoder.onnx`
-  - `GLM-OCR-ONNX/onnx/embed_tokens.onnx`
-  - `GLM-OCR-ONNX/onnx/decoder_model_merged.onnx`
-  - Optional quantized set:
-    - `GLM-OCR-ONNX/onnx/vision_encoder_quantized.onnx`
-    - `GLM-OCR-ONNX/onnx/embed_tokens_quantized.onnx`
-    - `GLM-OCR-ONNX/onnx/decoder_model_merged_quantized.onnx`
-- Native backend using `GLM-OCR/model.safetensors`
-- Autoregressive text decoding
-- Output written to `output.md`
-
-## Run
-
-From repository root:
-
-```text
-cargo run --release
-```
-
-By default this uses:
-
-- backend: `onnx`
-- model root: `GLM-OCR-ONNX`
-- image: `test.png`
-
-## CLI Arguments
-
-```text
---backend, -b <onnx|native>   Select inference backend
---model, -m <path>            Model root path
---image, -i <path>            Input image path
---onnx-cpu                    Force ONNX Runtime to use CPUExecutionProvider only
---onnx-quantized              Use quantized ONNX model files (*_quantized.onnx)
---verbose, -v                 Enable verbose logs (default)
---no-verbose                  Disable verbose logs; stream OCR text only
---help, -h                    Show help
-```
-
-Examples:
-
-```text
-cargo run --release -- --image test.png
-cargo run --release -- --backend native --model GLM-OCR --image test.png
-cargo run --release -- --backend onnx --model GLM-OCR-ONNX --image test.png
-cargo run --release -- --backend onnx --onnx-cpu --image test.png
-cargo run --release -- --backend onnx --onnx-quantized --image test.png
-cargo run --release -- --no-verbose --image test.png
-```
-
-## Environment Variables
-
-- `OCR_BACKEND`
-- `OCR_MODEL_ROOT`
-- `OCR_IMAGE`
-- `OCR_VERBOSE` (default: enabled)
-- `OCR_ONNX_CPU` (default: disabled; auto CUDA->CPU fallback)
-- `OCR_ONNX_QUANTIZED` (default: disabled; use non-quantized ONNX)
-- `OCR_MIN_PIXELS` (default: `12544`)
-- `OCR_MAX_PIXELS` (default: `1048576`)
-- `OCR_MAX_NEW_TOKENS` (default: `512`)
-- `OCR_STREAM_DECODE` (default: enabled)
-
-Resolution order:
-
-- Backend: `--backend` > `OCR_BACKEND` > default `onnx`
-- Model root: `--model` > `OCR_MODEL_ROOT` > backend default (`GLM-OCR-ONNX` for `onnx`, `GLM-OCR` for `native`)
-- Image: `--image` > `OCR_IMAGE` > `test.png`
-- Verbose: `--verbose`/`--no-verbose` > `OCR_VERBOSE` > default enabled
-- ONNX CPU mode: `--onnx-cpu` > `OCR_ONNX_CPU` > default disabled
-- ONNX quantized mode: `--onnx-quantized` > `OCR_ONNX_QUANTIZED` > default disabled
-
-## Notes
-
-- First build can be slow because dependencies must be downloaded and compiled.
-- If inference is slow in the vision stage, try lowering `OCR_MAX_PIXELS`.
+- **GGUF** — llama.cpp submodule, auto-build via cmake, Flash Attention, KV cache Q8_0, CUDA graph, ~78 tok/s on RTX 5080
+- **ONNX** — ONNX Runtime with CUDA execution provider
+- **Native** — Candle (safetensors) pure Rust backend
