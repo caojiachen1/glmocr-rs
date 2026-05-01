@@ -8,7 +8,7 @@ pub mod native_backend;
 #[cfg(feature = "gguf")]
 pub mod gguf_backend;
 #[cfg(feature = "gguf")]
-pub mod llama_cpp_sys;
+pub(crate) mod llama_cpp_sys;
 
 // ── Shared logging ──────────────────────────────────────────────────────────
 

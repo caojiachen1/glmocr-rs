@@ -2,6 +2,19 @@
 name = "glmocr_rs"
 version = "0.1.0"
 edition = "2021"
+description = "GLM-OCR Rust inference library with ONNX, Candle, and llama.cpp GGUF backends"
+license = "MIT"
+repository = "https://github.com/caojiachen1/glmocr_rs"
+keywords = ["ocr", "glm", "llama", "onnx", "multimodal"]
+categories = ["multimedia::images", "science"]
+
+[lib]
+name = "glmocr_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glmocr_rs"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

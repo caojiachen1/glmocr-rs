@@ -4,11 +4,7 @@ use std::{fs, io};
 
 use anyhow::{anyhow, bail, Result};
 
-mod backend;
-
-use backend::{ort_backend::OrtBackend, native_backend::NativeBackend, OcrBackend, log_info};
-#[cfg(feature = "gguf")]
-use backend::gguf_backend::GgufBackend;
+use glmocr_rs::{BackendType, OcrConfig, log_info};
 
 const DEFAULT_MIN_PIXELS: usize = 12_544;
 const DEFAULT_MAX_PIXELS: usize = 1_048_576;
@@ -37,6 +33,15 @@ impl BackendChoice {
             Self::Native => "native",
             #[cfg(feature = "gguf")]
             Self::Gguf => "gguf",
+        }
+    }
+
+    fn to_backend_type(self) -> BackendType {
+        match self {
+            Self::Onnx => BackendType::Onnx,
+            Self::Native => BackendType::Native,
+            #[cfg(feature = "gguf")]
+            Self::Gguf => BackendType::Gguf,
         }
     }
 
@@ -321,6 +326,7 @@ fn main() -> Result<()> {
 
     let min_pixels = read_env_usize("OCR_MIN_PIXELS", DEFAULT_MIN_PIXELS);
     let max_pixels = read_env_usize("OCR_MAX_PIXELS", DEFAULT_MAX_PIXELS);
+
     if verbose {
         log_info("MAIN", format!(
             "Model root: {} (source: {})",
@@ -352,21 +358,23 @@ fn main() -> Result<()> {
         ));
     }
 
-    if !opts.image_path.exists() {
-        bail!("Input image not found: {}", opts.image_path.display());
+    let config = OcrConfig {
+        model_root: opts.model_root.clone(),
+        image_path: opts.image_path.clone(),
+        backend: opts.backend.to_backend_type(),
+        cpu: opts.cpu,
+        onnx_quantized: opts.onnx_quantized,
+        min_pixels,
+        max_pixels,
+        verbose,
+    };
+
+    if verbose {
+        log_info("MAIN", format!("Active backend: {}", config.backend.as_str()));
     }
 
     let infer_start = Instant::now();
-    let mut backend: Box<dyn OcrBackend> = match opts.backend {
-        BackendChoice::Onnx => Box::new(OrtBackend::new(opts.cpu, opts.onnx_quantized)),
-        BackendChoice::Native => Box::new(NativeBackend::new(opts.cpu)),
-        #[cfg(feature = "gguf")]
-        BackendChoice::Gguf => Box::new(GgufBackend::new(opts.cpu)),
-    };
-    if verbose {
-        log_info("MAIN", format!("Active backend: {}", backend.name()));
-    }
-    let result = backend.infer(&opts.model_root, &opts.image_path, min_pixels, max_pixels)?;
+    let result = glmocr_rs::recognize(&config)?;
     let elapsed = infer_start.elapsed().as_secs_f64();
 
     // --timing: print structured data to stdout and exit
