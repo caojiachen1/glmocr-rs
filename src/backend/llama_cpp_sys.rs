@@ -214,10 +214,29 @@ pub struct MtmdDecoderPos {
     pub y: c_uint,
 }
 
+// ggml_log_level
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgmlLogLevel {
+    None = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+    Cont = 5,
+}
+
+pub type GgmlLogCallback = Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
+
 extern "C" {
     // Backend init/free
     pub fn llama_backend_init();
     pub fn llama_backend_free();
+
+    // Logging
+    pub fn llama_log_set(log_callback: GgmlLogCallback, user_data: *mut c_void);
+    pub fn mtmd_log_set(log_callback: GgmlLogCallback, user_data: *mut c_void);
+    pub fn mtmd_helper_log_set(log_callback: GgmlLogCallback, user_data: *mut c_void);
 
     // Default params
     pub fn llama_model_default_params() -> LlamaModelParams;

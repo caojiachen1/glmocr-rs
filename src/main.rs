@@ -11,47 +11,57 @@ const DEFAULT_MAX_PIXELS: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy)]
 enum BackendChoice {
-    Onnx,
-    Native,
     #[cfg(feature = "gguf")]
     Gguf,
+    #[cfg(feature = "aha")]
+    Aha,
+    Onnx,
+    Native,
 }
 
 impl BackendChoice {
     fn model_root(self) -> PathBuf {
         match self {
-            Self::Onnx => PathBuf::from("GLM-OCR-ONNX"),
-            Self::Native => PathBuf::from("GLM-OCR"),
             #[cfg(feature = "gguf")]
             Self::Gguf => PathBuf::from("GLM-OCR-GGUF"),
+            #[cfg(feature = "aha")]
+            Self::Aha => PathBuf::from("GLM-OCR"),
+            Self::Onnx => PathBuf::from("GLM-OCR-ONNX"),
+            Self::Native => PathBuf::from("GLM-OCR"),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Onnx => "onnx",
-            Self::Native => "native",
             #[cfg(feature = "gguf")]
             Self::Gguf => "gguf",
+            #[cfg(feature = "aha")]
+            Self::Aha => "aha",
+            Self::Onnx => "onnx",
+            Self::Native => "native",
         }
     }
 
     fn to_backend_type(self) -> BackendType {
         match self {
-            Self::Onnx => BackendType::Onnx,
-            Self::Native => BackendType::Native,
             #[cfg(feature = "gguf")]
             Self::Gguf => BackendType::Gguf,
+            #[cfg(feature = "aha")]
+            Self::Aha => BackendType::Aha,
+            Self::Onnx => BackendType::Onnx,
+            Self::Native => BackendType::Native,
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
-            "onnx" | "ort" => Some(Self::Onnx),
-            "native" | "nat" | "n" => Some(Self::Native),
             #[cfg(feature = "gguf")]
             "gguf" | "llama" | "ggml" => Some(Self::Gguf),
+            #[cfg(feature = "aha")]
+            "aha" | "a" => Some(Self::Aha),
+            "onnx" | "ort" => Some(Self::Onnx),
+            "native" | "nat" | "n" => Some(Self::Native),
             _ => None,
         }
     }
@@ -75,23 +85,28 @@ fn read_env_usize(name: &str, default: usize) -> usize {
 fn print_help(binary: &str) {
     println!("GLM OCR Rust Inference");
     println!();
+    #[cfg(any(feature = "gguf", feature = "aha"))]
+    { println!("Usage:"); }
     #[cfg(feature = "gguf")]
-    println!("Usage:");
-    #[cfg(feature = "gguf")]
-    println!("  {binary} [--backend <onnx|native|gguf>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
-    #[cfg(not(feature = "gguf"))]
-    println!("Usage:");
-    #[cfg(not(feature = "gguf"))]
-    println!("  {binary} [--backend <onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    println!("  {binary} [--backend <gguf|aha|onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    #[cfg(all(not(feature = "gguf"), feature = "aha"))]
+    println!("  {binary} [--backend <aha|onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    #[cfg(not(any(feature = "gguf", feature = "aha")))]
+    {
+        println!("Usage:");
+        println!("  {binary} [--backend <onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    }
     println!();
     println!("Arguments:");
     #[cfg(feature = "gguf")]
-    println!("  -b, --backend <name>   Select inference backend (onnx | native | gguf)");
-    #[cfg(not(feature = "gguf"))]
+    println!("  -b, --backend <name>   Select inference backend (gguf | aha | onnx | native)");
+    #[cfg(all(not(feature = "gguf"), feature = "aha"))]
+    println!("  -b, --backend <name>   Select inference backend (aha | onnx | native)");
+    #[cfg(not(any(feature = "gguf", feature = "aha")))]
     println!("  -b, --backend <name>   Select inference backend (onnx | native)");
     println!("  -m, --model <path>     Model root path");
     println!("  -i, --image <path>     Input image path");
-    println!("      --cpu              Force CPU mode (all backends: ONNX CPU-only, Native CPU-only, GGUF CPU-only)");
+    println!("      --cpu              Force CPU mode (all backends)");
     println!("      --onnx-quantized   Use quantized ONNX model files (*_quantized.onnx)");
     println!("      --timing           Print structured timing data to stdout (ELAPSED=... TOKENS=...)");
     println!("  -v, --verbose          Enable verbose logs (default)");
@@ -134,9 +149,9 @@ fn parse_cli_options() -> Result<CliOptions> {
             }
             "-b" | "--backend" => {
                 let v = args.next().ok_or_else(|| {
-                    #[cfg(feature = "gguf")]
-                    { anyhow!("Missing value for {arg}; allowed values: onnx | native | gguf") }
-                    #[cfg(not(feature = "gguf"))]
+                    #[cfg(any(feature = "gguf", feature = "aha"))]
+                    { anyhow!("Missing value for {arg}; allowed values: gguf | aha | onnx | native") }
+                    #[cfg(not(any(feature = "gguf", feature = "aha")))]
                     { anyhow!("Missing value for {arg}; allowed values: onnx | native") }
                 })?;
                 cli_backend = Some(v);
@@ -177,9 +192,9 @@ fn parse_cli_options() -> Result<CliOptions> {
             _ if arg.starts_with("--backend=") => {
                 let v = arg.trim_start_matches("--backend=").trim().to_string();
                 if v.is_empty() {
-                    #[cfg(feature = "gguf")]
-                    { bail!("Missing value for --backend=; allowed values: onnx | native | gguf"); }
-                    #[cfg(not(feature = "gguf"))]
+                    #[cfg(any(feature = "gguf", feature = "aha"))]
+                    { bail!("Missing value for --backend=; allowed values: gguf | aha | onnx | native"); }
+                    #[cfg(not(any(feature = "gguf", feature = "aha")))]
                     { bail!("Missing value for --backend=; allowed values: onnx | native"); }
                 }
                 cli_backend = Some(v);
@@ -238,17 +253,17 @@ fn parse_cli_options() -> Result<CliOptions> {
 
     let (backend, backend_source) = if let Some(v) = cli_backend {
         let backend = BackendChoice::parse(&v).ok_or_else(|| {
-            #[cfg(feature = "gguf")]
-            { anyhow!("Unsupported backend: {v}; allowed values: onnx | native | gguf") }
-            #[cfg(not(feature = "gguf"))]
+            #[cfg(any(feature = "gguf", feature = "aha"))]
+            { anyhow!("Unsupported backend: {v}; allowed values: gguf | aha | onnx | native") }
+            #[cfg(not(any(feature = "gguf", feature = "aha")))]
             { anyhow!("Unsupported backend: {v}; allowed values: onnx | native") }
         })?;
         (backend, "CLI(--backend)")
     } else if let Ok(v) = std::env::var("OCR_BACKEND") {
         let backend = BackendChoice::parse(&v).ok_or_else(|| {
-            #[cfg(feature = "gguf")]
-            { anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: onnx | native | gguf") }
-            #[cfg(not(feature = "gguf"))]
+            #[cfg(any(feature = "gguf", feature = "aha"))]
+            { anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: gguf | aha | onnx | native") }
+            #[cfg(not(any(feature = "gguf", feature = "aha")))]
             { anyhow!("Invalid OCR_BACKEND value: {v}; allowed values: onnx | native") }
         })?;
         (backend, "ENV(OCR_BACKEND)")

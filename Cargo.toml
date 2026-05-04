@@ -2,7 +2,7 @@
 name = "glmocr_rs"
 version = "0.1.0"
 edition = "2021"
-description = "GLM-OCR Rust inference library with ONNX, Candle, and llama.cpp GGUF backends"
+description = "GLM-OCR Rust inference library with ONNX, Candle, llama.cpp GGUF, and aha backends"
 license = "MIT"
 repository = "https://github.com/caojiachen1/glmocr_rs"
 keywords = ["ocr", "glm", "llama", "onnx", "multimodal"]
@@ -29,11 +29,14 @@ safetensors = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
+futures = "0.3"
+aha = { git = "https://github.com/caojiachen1/aha", branch = "main", optional = true }
 
 [features]
-default = ["cuda", "gguf"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+default = ["cuda", "gguf", "aha"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "aha/cuda", "aha/flash-attn"]
 gguf = []
+aha = ["dep:aha"]
 
 [profile.release]
 opt-level = 3

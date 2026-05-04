@@ -1,7 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::io::Write;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
@@ -13,6 +14,40 @@ const TAG: &str = "GGUF";
 const EOS_TOKEN_IDS: [LlamaToken; 4] = [59246, 59253, 59252, 59251];
 // GLM-OCR GGUF has 59392 tokens (from tokenizer.ggml.tokens metadata)
 const N_VOCAB: usize = 59392;
+
+static GGUF_VERBOSE: AtomicBool = AtomicBool::new(true);
+
+unsafe extern "C" fn llama_log_callback(level: c_int, text: *const c_char, _user_data: *mut c_void) {
+    if !GGUF_VERBOSE.load(Ordering::Relaxed) {
+        return;
+    }
+    if text.is_null() {
+        return;
+    }
+    let text = match CStr::from_ptr(text).to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return,
+    };
+    if text.is_empty() {
+        return;
+    }
+    let level_name = match level {
+        1 => "DEBUG",
+        3 => "WARN",
+        4 => "ERROR",
+        _ => "INFO",
+    };
+    eprintln!("[OCR][GGUF][LLAMA][{}] {}", level_name, text);
+}
+
+fn install_log_hooks() {
+    GGUF_VERBOSE.store(is_verbose(), Ordering::Relaxed);
+    unsafe {
+        llama_log_set(Some(llama_log_callback), std::ptr::null_mut());
+        mtmd_log_set(Some(llama_log_callback), std::ptr::null_mut());
+        mtmd_helper_log_set(Some(llama_log_callback), std::ptr::null_mut());
+    }
+}
 
 pub struct GgufBackend {
     force_cpu: bool,
@@ -56,6 +91,7 @@ impl Drop for LlamaState {
 
 fn init_llama(text_model_path: &Path, mmproj_path: &Path, force_cpu: bool) -> Result<LlamaState> {
     unsafe { llama_backend_init(); }
+    install_log_hooks();
 
     let n_threads = std::thread::available_parallelism()
         .map(|nz| nz.get() as c_int)

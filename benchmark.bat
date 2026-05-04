@@ -33,7 +33,7 @@ echo [BENCH] Unknown argument: %~1
 exit /b 1
 
 :usage
-echo Usage: benchmark.bat [--backend onnx^|native^|gguf] [--image path] [--runs N]
+echo Usage: benchmark.bat [--backend gguf^|aha^|onnx^|native] [--image path] [--runs N]
 echo   Default: test all backends with 5 runs each
 exit /b 0
 
@@ -46,11 +46,13 @@ if not exist "%EXE%" (
 if "%BACKEND%"=="" (
     echo [BENCH] Testing all backends, %RUNS% runs each
     echo.
+    call :bench_backend gguf
+    echo.
+    call :bench_backend aha
+    echo.
     call :bench_backend onnx
     echo.
     call :bench_backend native
-    echo.
-    call :bench_backend gguf
     echo.
     echo [BENCH] ========================================
     echo [BENCH]  Comparison

@@ -1,6 +1,6 @@
 # GLM OCR Rust
 
-Rust inference for GLM-OCR, powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) GGUF backend with full CUDA optimization.
+Rust inference for GLM-OCR, powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) GGUF, [aha](https://github.com/jhqxxx/aha), ONNX Runtime, and Candle backends with full CUDA optimization.
 
 ## Quick Start
 
@@ -10,6 +10,7 @@ git clone --recurse-submodules https://github.com/caojiachen1/glmocr_rs.git
 cd glmocr_rs
 
 # Place GGUF models in GLM-OCR-GGUF/ (GLM-OCR-Q8_0.gguf + mmproj-GLM-OCR-Q8_0.gguf)
+# Or safetensors weights in GLM-OCR/ (model.safetensors, tokenizer.json, config.json)
 # Place a test image as test.png
 
 # Run (default: gguf backend, GPU)
@@ -19,6 +20,7 @@ cargo run --release
 cargo run --release -- --cpu
 
 # Other backends
+cargo run --release -- --backend aha
 cargo run --release -- --backend onnx
 cargo run --release -- --backend native
 ```
@@ -26,7 +28,7 @@ cargo run --release -- --backend native
 ## CLI
 
 ```
-glmocr_rs [--backend <gguf|onnx|native>] [--model <path>] [--image <path>]
+glmocr_rs [--backend <gguf|aha|onnx|native>] [--model <path>] [--image <path>]
           [--cpu] [--timing] [--verbose|--no-verbose]
 ```
 
@@ -58,9 +60,9 @@ println!("{}", result.text);
 
 // Custom backend
 let result = recognize(&OcrConfig {
-    model_root: "GLM-OCR-GGUF".into(),
+    model_root: "GLM-OCR".into(),
     image_path: "scan.png".into(),
-    backend: BackendType::Gguf,
+    backend: BackendType::Aha,
     cpu: false,
     ..Default::default()
 })?;
@@ -73,7 +75,7 @@ let result = recognize(&OcrConfig {
 | `recognize(config)` | One-shot OCR inference |
 | `create_backend(config)` | Create backend instance for reuse |
 | `OcrConfig` | Configuration struct (`Default` available) |
-| `BackendType` | `Gguf` / `Onnx` / `Native` |
+| `BackendType` | `Gguf` / `Aha` / `Onnx` / `Native` |
 | `OcrBackend` | Trait for custom backends |
 | `InferResult` | `{ text, token_count }` |
 
@@ -82,11 +84,23 @@ let result = recognize(&OcrConfig {
 | Backend | Directory | Files |
 |---------|-----------|-------|
 | gguf (default) | `GLM-OCR-GGUF/` | `GLM-OCR-Q8_0.gguf`, `mmproj-GLM-OCR-Q8_0.gguf` |
-| native | `GLM-OCR/` | `model.safetensors`, `tokenizer.json`, `*.json` |
+| aha | `GLM-OCR/` | `model.safetensors`, `tokenizer.json`, `*.json` |
 | onnx | `GLM-OCR-ONNX/` | `onnx/*.onnx`, `tokenizer.json` |
+| native | `GLM-OCR/` | `model.safetensors`, `tokenizer.json`, `*.json` |
 
 ## Features
 
-- **GGUF** — llama.cpp submodule, auto-build via cmake, Flash Attention, KV cache Q8_0, CUDA graph, ~78 tok/s on RTX 5080
+- **GGUF** — llama.cpp submodule, auto-build via cmake, Flash Attention, KV cache Q8_0, CUDA graph
+- **aha** — [aha](https://github.com/jhqxxx/aha) crate, OpenAI-compatible streaming API, auto device detection with CUDA priority
 - **ONNX** — ONNX Runtime with CUDA execution provider
 - **Native** — Candle (safetensors) pure Rust backend
+
+## Benchmark
+
+```bash
+# Test all backends
+benchmark.bat
+
+# Single backend
+benchmark.bat --backend gguf --runs 10
+```

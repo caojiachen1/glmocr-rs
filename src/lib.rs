@@ -4,10 +4,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use backend::native_backend::NativeBackend;
-use backend::ort_backend::OrtBackend;
 #[cfg(feature = "gguf")]
 use backend::gguf_backend::GgufBackend;
+#[cfg(feature = "aha")]
+use backend::aha_backend::AhaBackend;
+use backend::ort_backend::OrtBackend;
+use backend::native_backend::NativeBackend;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -24,23 +26,28 @@ pub use backend::{
 /// Supported OCR backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
+    /// llama.cpp GGUF backend (GPU + CPU, fastest).
+    #[cfg(feature = "gguf")]
+    Gguf,
+    /// aha crate backend (GPU + CPU, streaming via HTTP-compatible API).
+    #[cfg(feature = "aha")]
+    Aha,
     /// ONNX Runtime backend (GPU + CPU).
     Onnx,
     /// Candle native Rust backend (GPU + CPU).
     Native,
-    /// llama.cpp GGUF backend (GPU + CPU, fastest).
-    #[cfg(feature = "gguf")]
-    Gguf,
 }
 
 impl BackendType {
     /// Human-readable name for this backend.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Onnx => "onnx",
-            Self::Native => "native",
             #[cfg(feature = "gguf")]
             Self::Gguf => "gguf",
+            #[cfg(feature = "aha")]
+            Self::Aha => "aha",
+            Self::Onnx => "onnx",
+            Self::Native => "native",
         }
     }
 }
@@ -106,10 +113,12 @@ impl OcrConfig {
     /// Create a new config with defaults, overriding the backend.
     pub fn with_backend(backend: BackendType) -> Self {
         let model_root = match backend {
-            BackendType::Onnx => PathBuf::from("GLM-OCR-ONNX"),
-            BackendType::Native => PathBuf::from("GLM-OCR"),
             #[cfg(feature = "gguf")]
             BackendType::Gguf => PathBuf::from("GLM-OCR-GGUF"),
+            #[cfg(feature = "aha")]
+            BackendType::Aha => PathBuf::from("GLM-OCR"),
+            BackendType::Onnx => PathBuf::from("GLM-OCR-ONNX"),
+            BackendType::Native => PathBuf::from("GLM-OCR"),
         };
         Self {
             model_root,
@@ -127,10 +136,12 @@ impl OcrConfig {
 /// directly if you need fine-grained control.
 pub fn create_backend(config: &OcrConfig) -> Box<dyn OcrBackend> {
     match config.backend {
-        BackendType::Onnx => Box::new(OrtBackend::new(config.cpu, config.onnx_quantized)),
-        BackendType::Native => Box::new(NativeBackend::new(config.cpu)),
         #[cfg(feature = "gguf")]
         BackendType::Gguf => Box::new(GgufBackend::new(config.cpu)),
+        #[cfg(feature = "aha")]
+        BackendType::Aha => Box::new(AhaBackend::new(config.cpu)),
+        BackendType::Onnx => Box::new(OrtBackend::new(config.cpu, config.onnx_quantized)),
+        BackendType::Native => Box::new(NativeBackend::new(config.cpu)),
     }
 }
 
