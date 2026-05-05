@@ -88,7 +88,7 @@ fn print_help(binary: &str) {
     #[cfg(any(feature = "gguf", feature = "aha"))]
     { println!("Usage:"); }
     #[cfg(feature = "gguf")]
-    println!("  {binary} [--backend <gguf|aha|onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
+    println!("  {binary} [--backend <gguf|aha|onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--gguf-llama-dll <path>] [--gguf-mtmd-dll <path>] [--verbose|--no-verbose]");
     #[cfg(all(not(feature = "gguf"), feature = "aha"))]
     println!("  {binary} [--backend <aha|onnx|native>] [--model <path>] [--image <path>] [--cpu] [--onnx-quantized] [--timing] [--verbose|--no-verbose]");
     #[cfg(not(any(feature = "gguf", feature = "aha")))]
@@ -109,6 +109,8 @@ fn print_help(binary: &str) {
     println!("      --cpu              Force CPU mode (all backends)");
     println!("      --onnx-quantized   Use quantized ONNX model files (*_quantized.onnx)");
     println!("      --timing           Print structured timing data to stdout (ELAPSED=... TOKENS=...)");
+    println!("      --gguf-llama-dll   Path to llama.dll for GGUF backend (env: GGUF_LLAMA_DLL)");
+    println!("      --gguf-mtmd-dll    Path to mtmd.dll for GGUF backend (env: GGUF_MTMD_DLL)");
     println!("  -v, --verbose          Enable verbose logs (default)");
     println!("      --no-verbose       Disable verbose logs; stream OCR text only");
     println!("  -h, --help             Show help");
@@ -128,6 +130,10 @@ struct CliOptions {
     onnx_quantized: bool,
     onnx_quantized_source: &'static str,
     timing: bool,
+    gguf_llama_dll: Option<String>,
+    gguf_llama_source: &'static str,
+    gguf_mtmd_dll: Option<String>,
+    gguf_mtmd_source: &'static str,
 }
 
 fn parse_cli_options() -> Result<CliOptions> {
@@ -140,6 +146,8 @@ fn parse_cli_options() -> Result<CliOptions> {
     let mut cli_cpu: Option<bool> = None;
     let mut cli_onnx_quantized: Option<bool> = None;
     let mut cli_timing = false;
+    let mut cli_gguf_llama_dll: Option<String> = None;
+    let mut cli_gguf_mtmd_dll: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -189,15 +197,29 @@ fn parse_cli_options() -> Result<CliOptions> {
             "--timing" => {
                 cli_timing = true;
             }
-            _ if arg.starts_with("--backend=") => {
-                let v = arg.trim_start_matches("--backend=").trim().to_string();
+            "--gguf-llama-dll" => {
+                let v = args.next()
+                    .ok_or_else(|| anyhow!("Missing value for {arg}; expected path to llama.dll"))?;
+                cli_gguf_llama_dll = Some(v);
+            }
+            "--gguf-mtmd-dll" => {
+                let v = args.next()
+                    .ok_or_else(|| anyhow!("Missing value for {arg}; expected path to mtmd.dll"))?;
+                cli_gguf_mtmd_dll = Some(v);
+            }
+            _ if arg.starts_with("--gguf-llama-dll=") => {
+                let v = arg.trim_start_matches("--gguf-llama-dll=").trim().to_string();
                 if v.is_empty() {
-                    #[cfg(any(feature = "gguf", feature = "aha"))]
-                    { bail!("Missing value for --backend=; allowed values: gguf | aha | onnx | native"); }
-                    #[cfg(not(any(feature = "gguf", feature = "aha")))]
-                    { bail!("Missing value for --backend=; allowed values: onnx | native"); }
+                    bail!("Missing value for --gguf-llama-dll=; expected path to llama.dll");
                 }
-                cli_backend = Some(v);
+                cli_gguf_llama_dll = Some(v);
+            }
+            _ if arg.starts_with("--gguf-mtmd-dll=") => {
+                let v = arg.trim_start_matches("--gguf-mtmd-dll=").trim().to_string();
+                if v.is_empty() {
+                    bail!("Missing value for --gguf-mtmd-dll=; expected path to mtmd.dll");
+                }
+                cli_gguf_mtmd_dll = Some(v);
             }
             _ if arg.starts_with("--model=") => {
                 let v = arg.trim_start_matches("--model=").trim().to_string();
@@ -245,7 +267,7 @@ fn parse_cli_options() -> Result<CliOptions> {
             }
             _ => {
                 bail!(
-                    "Unknown argument: {arg}. Available arguments: -b/--backend, -m/--model, -i/--image, --cpu, --onnx-quantized, --timing, -v/--verbose, --no-verbose, -h/--help"
+                    "Unknown argument: {arg}. Available arguments: -b/--backend, -m/--model, -i/--image, --cpu, --onnx-quantized, --timing, --gguf-llama-dll, --gguf-mtmd-dll, -v/--verbose, --no-verbose, -h/--help"
                 );
             }
         }
@@ -317,6 +339,22 @@ fn parse_cli_options() -> Result<CliOptions> {
         (false, "DEFAULT")
     };
 
+    let (gguf_llama_dll, gguf_llama_source) = if let Some(v) = cli_gguf_llama_dll {
+        (Some(v), "CLI(--gguf-llama-dll)")
+    } else if let Ok(v) = std::env::var("GGUF_LLAMA_DLL") {
+        (Some(v), "ENV(GGUF_LLAMA_DLL)")
+    } else {
+        (None, "DEFAULT")
+    };
+
+    let (gguf_mtmd_dll, gguf_mtmd_source) = if let Some(v) = cli_gguf_mtmd_dll {
+        (Some(v), "CLI(--gguf-mtmd-dll)")
+    } else if let Ok(v) = std::env::var("GGUF_MTMD_DLL") {
+        (Some(v), "ENV(GGUF_MTMD_DLL)")
+    } else {
+        (None, "DEFAULT")
+    };
+
     Ok(CliOptions {
         backend,
         backend_source,
@@ -331,6 +369,10 @@ fn parse_cli_options() -> Result<CliOptions> {
         onnx_quantized,
         onnx_quantized_source,
         timing: cli_timing,
+        gguf_llama_dll,
+        gguf_llama_source,
+        gguf_mtmd_dll,
+        gguf_mtmd_source,
     })
 }
 
@@ -379,9 +421,22 @@ fn main() -> Result<()> {
             "Pixel constraints: OCR_MIN_PIXELS={}, OCR_MAX_PIXELS={}",
             min_pixels, max_pixels
         ));
+        #[cfg(feature = "gguf")]
+        {
+            log_info("MAIN", format!(
+                "GGUF llama DLL: {} (source: {})",
+                opts.gguf_llama_dll.as_deref().unwrap_or("default"),
+                opts.gguf_llama_source
+            ));
+            log_info("MAIN", format!(
+                "GGUF mtmd DLL: {} (source: {})",
+                opts.gguf_mtmd_dll.as_deref().unwrap_or("default"),
+                opts.gguf_mtmd_source
+            ));
+        }
     }
 
-    let config = OcrConfig {
+    let mut config = OcrConfig {
         model_root: opts.model_root.clone(),
         image_path: opts.image_path.clone(),
         backend: opts.backend.to_backend_type(),
@@ -390,7 +445,16 @@ fn main() -> Result<()> {
         min_pixels,
         max_pixels,
         verbose,
+        ..Default::default()
     };
+
+    #[cfg(feature = "gguf")]
+    if opts.gguf_llama_dll.is_some() || opts.gguf_mtmd_dll.is_some() {
+        config.gguf_lib = Some(glmocr_rs::GgufLibConfig {
+            llama_dll: opts.gguf_llama_dll.map(PathBuf::from),
+            mtmd_dll: opts.gguf_mtmd_dll.map(PathBuf::from),
+        });
+    }
 
     if verbose {
         log_info("MAIN", format!("Active backend: {}", config.backend.as_str()));

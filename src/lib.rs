@@ -1,11 +1,14 @@
 pub mod backend;
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 
 #[cfg(feature = "gguf")]
 use backend::gguf_backend::GgufBackend;
+#[cfg(feature = "gguf")]
+use backend::llama_cpp_loader::LlamaCppLib;
 #[cfg(feature = "aha")]
 use backend::aha_backend::AhaBackend;
 use backend::ort_backend::OrtBackend;
@@ -22,6 +25,9 @@ pub use backend::{
     log_stage_end,
     log_stream,
 };
+
+#[cfg(feature = "gguf")]
+pub use backend::llama_cpp_loader::GgufLibConfig;
 
 /// Supported OCR backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +92,10 @@ pub struct OcrConfig {
     pub max_pixels: usize,
     /// Print progress and timing to stderr.
     pub verbose: bool,
+    /// GGUF-specific: custom DLL paths for llama.cpp libraries.
+    /// When `None` (default), libraries are resolved via env vars then default OS search path.
+    #[cfg(feature = "gguf")]
+    pub gguf_lib: Option<GgufLibConfig>,
 }
 
 impl Default for OcrConfig {
@@ -105,6 +115,8 @@ impl Default for OcrConfig {
             min_pixels: 12_544,
             max_pixels: 1_048_576,
             verbose: true,
+            #[cfg(feature = "gguf")]
+            gguf_lib: None,
         }
     }
 }
@@ -130,18 +142,39 @@ impl OcrConfig {
 
 // ── API ───────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "gguf")]
+static CACHED_GGUF_LIB: OnceLock<Arc<LlamaCppLib>> = OnceLock::new();
+
+#[cfg(feature = "gguf")]
+fn get_or_load_gguf_lib(config: &OcrConfig) -> Result<Arc<LlamaCppLib>> {
+    if let Some(ref lib_config) = config.gguf_lib {
+        // Custom config — always load fresh (not cached)
+        return Ok(Arc::new(LlamaCppLib::load(lib_config)?));
+    }
+    // Default config — cache for reuse across calls
+    Ok(CACHED_GGUF_LIB
+        .get_or_init(|| {
+            Arc::new(LlamaCppLib::load(&GgufLibConfig::default())
+                .expect("Failed to load default GGUF libraries"))
+        })
+        .clone())
+}
+
 /// Create a backend instance from the given backend type.
 ///
 /// The returned boxed trait object implements [`OcrBackend`] and can be used
 /// directly if you need fine-grained control.
-pub fn create_backend(config: &OcrConfig) -> Box<dyn OcrBackend> {
+pub fn create_backend(config: &OcrConfig) -> Result<Box<dyn OcrBackend>> {
     match config.backend {
         #[cfg(feature = "gguf")]
-        BackendType::Gguf => Box::new(GgufBackend::new(config.cpu)),
+        BackendType::Gguf => {
+            let lib = get_or_load_gguf_lib(config)?;
+            Ok(Box::new(GgufBackend::new(lib, config.cpu)))
+        }
         #[cfg(feature = "aha")]
-        BackendType::Aha => Box::new(AhaBackend::new(config.cpu)),
-        BackendType::Onnx => Box::new(OrtBackend::new(config.cpu, config.onnx_quantized)),
-        BackendType::Native => Box::new(NativeBackend::new(config.cpu)),
+        BackendType::Aha => Ok(Box::new(AhaBackend::new(config.cpu))),
+        BackendType::Onnx => Ok(Box::new(OrtBackend::new(config.cpu, config.onnx_quantized))),
+        BackendType::Native => Ok(Box::new(NativeBackend::new(config.cpu))),
     }
 }
 
@@ -174,7 +207,7 @@ pub fn recognize(config: &OcrConfig) -> Result<InferResult> {
         anyhow::bail!("Input image not found: {}", config.image_path.display());
     }
 
-    let mut backend = create_backend(config);
+    let mut backend = create_backend(config)?;
     backend.infer(
         &config.model_root,
         &config.image_path,

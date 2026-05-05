@@ -1807,6 +1807,7 @@ dependencies = [
  "candle-transformers 0.10.2 (git+https://github.com/huggingface/candle.git)",
  "futures",
  "image",
+ "libloading 0.8.9",
  "ndarray",
  "ort",
  "rayon",
