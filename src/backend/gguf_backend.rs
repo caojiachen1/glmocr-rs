@@ -54,11 +54,29 @@ fn install_log_hooks(lib: &LlamaCppLib) {
 pub struct GgufBackend {
     lib: Arc<LlamaCppLib>,
     force_cpu: bool,
+    // Persistent model state — loaded lazily on first infer(), stays alive across calls.
+    loaded: bool,
+    model: *mut LlamaModel,
+    ctx: *mut LlamaContext,
+    vocab: *const LlamaVocab,
+    mtmd_ctx: *mut MtmdContext,
+    n_threads: c_int,
+    loaded_model_root: Option<PathBuf>,
 }
 
 impl GgufBackend {
     pub fn new(lib: Arc<LlamaCppLib>, force_cpu: bool) -> Self {
-        Self { lib, force_cpu }
+        Self {
+            lib,
+            force_cpu,
+            loaded: false,
+            model: std::ptr::null_mut(),
+            ctx: std::ptr::null_mut(),
+            vocab: std::ptr::null(),
+            mtmd_ctx: std::ptr::null_mut(),
+            n_threads: 4,
+            loaded_model_root: None,
+        }
     }
 
     fn model_paths(model_root: &Path) -> (PathBuf, PathBuf) {
@@ -66,117 +84,152 @@ impl GgufBackend {
         let mmproj = model_root.join("mmproj-GLM-OCR-Q8_0.gguf");
         (text_model, mmproj)
     }
-}
 
-struct LlamaState {
-    model: *mut LlamaModel,
-    ctx: *mut LlamaContext,
-    vocab: *const LlamaVocab,
-    mtmd_ctx: *mut MtmdContext,
-    lib: Arc<LlamaCppLib>,
-}
+    /// Returns true if model is loaded and ready for inference.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
 
-impl Drop for LlamaState {
-    fn drop(&mut self) {
+    /// Explicitly unload the model, freeing GPU/CPU memory.
+    /// The backend remains usable — next `infer()` will reload automatically.
+    pub fn unload(&mut self) {
+        if !self.loaded {
+            return;
+        }
+        let lib = &self.lib;
         unsafe {
             if !self.mtmd_ctx.is_null() {
-                (self.lib.mtmd_free)(self.mtmd_ctx);
+                (lib.mtmd_free)(self.mtmd_ctx);
             }
             if !self.ctx.is_null() {
-                (self.lib.llama_free)(self.ctx);
+                (lib.llama_free)(self.ctx);
             }
             if !self.model.is_null() {
-                (self.lib.llama_model_free)(self.model);
+                (lib.llama_model_free)(self.model);
             }
-            (self.lib.llama_backend_free)();
+            (lib.llama_backend_free)();
         }
+        self.loaded = false;
+        self.model = std::ptr::null_mut();
+        self.ctx = std::ptr::null_mut();
+        self.vocab = std::ptr::null();
+        self.mtmd_ctx = std::ptr::null_mut();
+        self.loaded_model_root = None;
+    }
+
+    fn ensure_loaded(&mut self, model_root: &Path) -> Result<()> {
+        if self.loaded {
+            // If model root changed, reload
+            if self.loaded_model_root.as_deref() != Some(model_root) {
+                log_info(TAG, "Model root changed, reloading...");
+                self.unload();
+            } else {
+                return Ok(());
+            }
+        }
+
+        let lib = &self.lib;
+        let (text_model_path, mmproj_path) = Self::model_paths(model_root);
+        for p in [&text_model_path, &mmproj_path] {
+            if !p.exists() {
+                bail!("Missing file: {}", p.display());
+            }
+        }
+
+        let stage = "Load model (persistent)";
+        let stage_t = Instant::now();
+        log_stage_start(TAG, stage);
+
+        unsafe { (lib.llama_backend_init)(); }
+        install_log_hooks(lib);
+
+        let n_threads = std::thread::available_parallelism()
+            .map(|nz| nz.get() as c_int)
+            .unwrap_or(4);
+
+        // Load text model
+        let model_path_c = CString::new(text_model_path.to_str().unwrap())
+            .map_err(|_| anyhow!("Invalid model path"))?;
+
+        let mut mparams = unsafe { (lib.llama_model_default_params)() };
+        mparams.n_gpu_layers = if self.force_cpu { 0 } else { -1 };
+        mparams.use_mmap = true;
+
+        log_info(TAG, format!("Loading text model: {}", text_model_path.display()));
+        let model = unsafe { (lib.llama_model_load_from_file)(model_path_c.as_ptr(), mparams) };
+        if model.is_null() {
+            bail!("Failed to load text model from {}", text_model_path.display());
+        }
+        log_info(TAG, "Text model loaded successfully");
+
+        // Create context
+        let mut cparams = unsafe { (lib.llama_context_default_params)() };
+        cparams.n_ctx = 8192;
+        cparams.n_batch = 512;
+        cparams.n_ubatch = 512;
+        cparams.n_threads = n_threads;
+        cparams.n_threads_batch = n_threads;
+        cparams.flash_attn_type = if self.force_cpu { LlamaFlashAttnType::Disabled } else { LlamaFlashAttnType::Enabled };
+        cparams.offload_kqv = !self.force_cpu;
+        if !self.force_cpu {
+            cparams.type_k = GgmlType::Q8_0;
+            cparams.type_v = GgmlType::Q8_0;
+        }
+        cparams.no_perf = false;
+        cparams.op_offload = !self.force_cpu;
+
+        let ctx = unsafe { (lib.llama_init_from_model)(model, cparams) };
+        if ctx.is_null() {
+            unsafe { (lib.llama_model_free)(model); }
+            bail!("Failed to create llama context");
+        }
+        log_info(TAG, "Llama context created successfully");
+
+        // Initialize multimodal context
+        let mmproj_c = CString::new(mmproj_path.to_str().unwrap())
+            .map_err(|_| anyhow!("Invalid mmproj path"))?;
+
+        let mut mtmd_p = unsafe { (lib.mtmd_context_params_default)() };
+        mtmd_p.use_gpu = !self.force_cpu;
+        mtmd_p.n_threads = n_threads;
+        mtmd_p.flash_attn_type = if self.force_cpu { LlamaFlashAttnType::Disabled } else { LlamaFlashAttnType::Enabled };
+        mtmd_p.warmup = true;
+
+        log_info(TAG, format!("Loading mmproj: {}", mmproj_path.display()));
+        let mtmd_ctx = unsafe { (lib.mtmd_init_from_file)(mmproj_c.as_ptr(), model, mtmd_p) };
+        if mtmd_ctx.is_null() {
+            unsafe { (lib.llama_free)(ctx); (lib.llama_model_free)(model); }
+            bail!("Failed to load mmproj from {}", mmproj_path.display());
+        }
+        log_info(TAG, "Multimodal context initialized successfully");
+
+        let vocab = unsafe { (lib.llama_model_get_vocab)(model) };
+        if vocab.is_null() {
+            unsafe { (lib.llama_free)(ctx); (lib.llama_model_free)(model); }
+            bail!("Failed to get vocab from model");
+        }
+
+        self.model = model;
+        self.ctx = ctx;
+        self.vocab = vocab;
+        self.mtmd_ctx = mtmd_ctx;
+        self.n_threads = n_threads;
+        self.loaded = true;
+        self.loaded_model_root = Some(model_root.to_path_buf());
+
+        log_stage_end(TAG, stage, stage_t);
+        log_info(TAG, "Model loaded — will persist across infer() calls");
+        Ok(())
     }
 }
 
-fn init_llama(
-    lib: Arc<LlamaCppLib>,
-    text_model_path: &Path,
-    mmproj_path: &Path,
-    force_cpu: bool,
-) -> Result<LlamaState> {
-    unsafe { (lib.llama_backend_init)(); }
-    install_log_hooks(&lib);
-
-    let n_threads = std::thread::available_parallelism()
-        .map(|nz| nz.get() as c_int)
-        .unwrap_or(4);
-
-    // Load text model with full GPU offload
-    let model_path_c = CString::new(text_model_path.to_str().unwrap())
-        .map_err(|_| anyhow!("Invalid model path"))?;
-
-    let mut mparams = unsafe { (lib.llama_model_default_params)() };
-    mparams.n_gpu_layers = if force_cpu { 0 } else { -1 }; // -1 = offload ALL layers to GPU
-    mparams.use_mmap = true;
-
-    log_info(TAG, format!("Loading text model: {}", text_model_path.display()));
-    let model = unsafe { (lib.llama_model_load_from_file)(model_path_c.as_ptr(), mparams) };
-    if model.is_null() {
-        bail!("Failed to load text model from {}", text_model_path.display());
+impl Drop for GgufBackend {
+    fn drop(&mut self) {
+        self.unload();
     }
-    log_info(TAG, "Text model loaded successfully");
-
-    // Create context with maximum CUDA optimizations
-    let mut cparams = unsafe { (lib.llama_context_default_params)() };
-    cparams.n_ctx = 8192;
-    cparams.n_batch = 512;
-    cparams.n_ubatch = 512;
-    cparams.n_threads = n_threads;
-    cparams.n_threads_batch = n_threads;
-    cparams.flash_attn_type = if force_cpu { LlamaFlashAttnType::Disabled } else { LlamaFlashAttnType::Enabled };
-    cparams.offload_kqv = !force_cpu;
-    // KV cache quantization (Q8_0) requires flash attention — disable on CPU
-    if !force_cpu {
-        cparams.type_k = GgmlType::Q8_0;
-        cparams.type_v = GgmlType::Q8_0;
-    }
-    cparams.no_perf = false;
-    cparams.op_offload = !force_cpu;
-
-    log_info(TAG, format!(
-        "Context: n_ctx={}, n_batch={}, n_ubatch={}, flash_attn={}, offload_kqv={}, type_k/v={}, threads={}",
-        if force_cpu { "default" } else { "Q8_0" },
-        cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, !force_cpu, !force_cpu, n_threads
-    ));
-
-    let ctx = unsafe { (lib.llama_init_from_model)(model, cparams) };
-    if ctx.is_null() {
-        unsafe { (lib.llama_model_free)(model); }
-        bail!("Failed to create llama context");
-    }
-    log_info(TAG, "Llama context created successfully");
-
-    // Initialize multimodal context
-    let mmproj_c = CString::new(mmproj_path.to_str().unwrap())
-        .map_err(|_| anyhow!("Invalid mmproj path"))?;
-
-    let mut mtmd_p = unsafe { (lib.mtmd_context_params_default)() };
-    mtmd_p.use_gpu = !force_cpu;
-    mtmd_p.n_threads = n_threads;
-    mtmd_p.flash_attn_type = if force_cpu { LlamaFlashAttnType::Disabled } else { LlamaFlashAttnType::Enabled };
-    mtmd_p.warmup = true;
-
-    log_info(TAG, format!("Loading mmproj: {}", mmproj_path.display()));
-    let mtmd_ctx = unsafe { (lib.mtmd_init_from_file)(mmproj_c.as_ptr(), model, mtmd_p) };
-    if mtmd_ctx.is_null() {
-        unsafe { (lib.llama_free)(ctx); (lib.llama_model_free)(model); }
-        bail!("Failed to load mmproj from {}", mmproj_path.display());
-    }
-    log_info(TAG, "Multimodal context initialized successfully");
-
-    let vocab = unsafe { (lib.llama_model_get_vocab)(model) };
-    if vocab.is_null() {
-        unsafe { (lib.llama_free)(ctx); (lib.llama_model_free)(model); }
-        bail!("Failed to get vocab from model");
-    }
-
-    Ok(LlamaState { model, ctx, vocab, mtmd_ctx, lib })
 }
+
+// ── Standalone helpers ─────────────────────────────────────────────────────────
 
 fn token_to_string(lib: &LlamaCppLib, vocab: *const LlamaVocab, token: LlamaToken) -> Result<String> {
     let mut buf = [0u8; 512];
@@ -209,6 +262,8 @@ fn argmax(logits: &[f32]) -> LlamaToken {
         .unwrap_or(EOS_TOKEN_IDS[0])
 }
 
+// ── OcrBackend impl ────────────────────────────────────────────────────────────
+
 impl OcrBackend for GgufBackend {
     fn name(&self) -> &'static str {
         if self.force_cpu { "gguf (CPU forced)" } else { "gguf" }
@@ -221,31 +276,27 @@ impl OcrBackend for GgufBackend {
         _min_pixels: usize,
         _max_pixels: usize,
     ) -> Result<InferResult> {
-        let lib = &self.lib;
         let total_t = Instant::now();
         log_stage_start(TAG, "GGUF OCR inference");
 
-        let (text_model_path, mmproj_path) = Self::model_paths(model_root);
-        for p in [&text_model_path, &mmproj_path] {
-            if !p.exists() { bail!("Missing file: {}", p.display()); }
-        }
-        log_info(TAG, "File check passed: text model + mmproj both exist");
+        // ── Ensure model is loaded ──
+        self.ensure_loaded(model_root)?;
+        let lib = &self.lib;
+        let ctx = self.ctx;
+        let vocab = self.vocab;
+        let mtmd_ctx = self.mtmd_ctx;
 
-        // Initialize
-        let stage = "Initialize llama.cpp";
-        let stage_t = Instant::now();
-        log_stage_start(TAG, stage);
-        let state = init_llama(Arc::clone(lib), &text_model_path, &mmproj_path, self.force_cpu)?;
-        log_stage_end(TAG, stage, stage_t);
+        // Clear KV cache for fresh inference
+        unsafe { (lib.llama_kv_cache_clear)(ctx); }
 
-        // Load image
+        // ── Load and encode image ──
         let stage = "Load and encode image";
         let stage_t = Instant::now();
         log_stage_start(TAG, stage);
 
         let image_path_c = CString::new(image_path.to_str().unwrap())
             .map_err(|_| anyhow!("Invalid image path"))?;
-        let bitmap = unsafe { (lib.mtmd_helper_bitmap_init_from_file)(state.mtmd_ctx, image_path_c.as_ptr()) };
+        let bitmap = unsafe { (lib.mtmd_helper_bitmap_init_from_file)(mtmd_ctx, image_path_c.as_ptr()) };
         if bitmap.is_null() { bail!("Failed to load image: {}", image_path.display()); }
         log_info(TAG, format!("Image loaded: {}", image_path.display()));
 
@@ -273,7 +324,7 @@ impl OcrBackend for GgufBackend {
             bail!("Failed to create input chunks");
         }
 
-        let res = unsafe { (lib.mtmd_tokenize)(state.mtmd_ctx, chunks, &input_text, bitmaps_arr.as_ptr(), 1) };
+        let res = unsafe { (lib.mtmd_tokenize)(mtmd_ctx, chunks, &input_text, bitmaps_arr.as_ptr(), 1) };
         unsafe { (lib.mtmd_bitmap_free)(bitmap); }
         if res != 0 {
             unsafe { (lib.mtmd_input_chunks_free)(chunks); }
@@ -290,7 +341,7 @@ impl OcrBackend for GgufBackend {
         let mut new_n_past: LlamaPos = 0;
         let eval_res = unsafe {
             (lib.mtmd_helper_eval_chunks)(
-                state.mtmd_ctx, state.ctx, chunks,
+                mtmd_ctx, ctx, chunks,
                 0, 0, n_batch, true, &mut new_n_past,
             )
         };
@@ -303,7 +354,7 @@ impl OcrBackend for GgufBackend {
         log_stage_end(TAG, stage, stage_t);
 
         // ── Get logits for the first generated token ──
-        let logits_ptr = unsafe { (lib.llama_get_logits)(state.ctx) };
+        let logits_ptr = unsafe { (lib.llama_get_logits)(ctx) };
         if logits_ptr.is_null() {
             bail!("llama_get_logits returned null");
         }
@@ -329,7 +380,7 @@ impl OcrBackend for GgufBackend {
 
         // Stream first token
         if stream_decode {
-            let piece = token_to_string(lib, state.vocab, first_token)?;
+            let piece = token_to_string(lib, vocab, first_token)?;
             if !piece.is_empty() {
                 if verbose { log_stream(TAG, 0, &piece); }
                 else { print!("{}", piece); let _ = std::io::stdout().flush(); }
@@ -360,14 +411,14 @@ impl OcrBackend for GgufBackend {
                 *batch.logits = 1;
             }
 
-            let dec_res = unsafe { (lib.llama_decode)(state.ctx, batch) };
+            let dec_res = unsafe { (lib.llama_decode)(ctx, batch) };
             unsafe { (lib.llama_batch_free)(batch); }
             if dec_res != 0 {
                 bail!("llama_decode failed at step {} with code {}", step, dec_res);
             }
 
             // Get logits and pick next token
-            let logits_ptr = unsafe { (lib.llama_get_logits)(state.ctx) };
+            let logits_ptr = unsafe { (lib.llama_get_logits)(ctx) };
             if logits_ptr.is_null() {
                 bail!("llama_get_logits returned null at step {}", step);
             }
@@ -378,7 +429,7 @@ impl OcrBackend for GgufBackend {
             n_past += 1;
 
             if stream_decode {
-                let piece = token_to_string(lib, state.vocab, next_token)?;
+                let piece = token_to_string(lib, vocab, next_token)?;
                 if !piece.is_empty() {
                     if verbose { log_stream(TAG, step + 1, &piece); }
                     else { print!("{}", piece); let _ = std::io::stdout().flush(); }
@@ -396,24 +447,23 @@ impl OcrBackend for GgufBackend {
         }
 
         log_stage_end(TAG, stage, stage_t);
+        log_stage_end(TAG, "GGUF OCR inference", total_t);
 
         // Decode all generated tokens to text
         let mut output = String::new();
         for &tok in &generated_tokens {
             if EOS_TOKEN_IDS.contains(&tok) { break; }
-            let piece = token_to_string(lib, state.vocab, tok)?;
+            let piece = token_to_string(lib, vocab, tok)?;
             output.push_str(&piece);
         }
-
-        // LlamaState Drop handles cleanup automatically
-
-        log_stage_end(TAG, "GGUF OCR inference", total_t);
 
         log_info(TAG, format!(
             "Inference finished, elapsed {:.3}s, {} tokens",
             total_t.elapsed().as_secs_f64(),
             generated_tokens.len()
         ));
+
+        // NOTE: model/context stay alive for next call
 
         Ok(InferResult {
             text: output,

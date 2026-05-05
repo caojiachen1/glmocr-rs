@@ -117,6 +117,9 @@ pub struct LlamaCppLib {
     // ── Vocab ──
     pub llama_vocab_n_tokens: unsafe extern "C" fn(*const LlamaVocab) -> c_int,
 
+    // ── KV cache ──
+    pub llama_kv_cache_clear: unsafe extern "C" fn(*mut LlamaContext),
+
     // ── Token ──
     pub llama_tokenize: unsafe extern "C" fn(
         *const LlamaVocab, *const c_char, c_int,
@@ -269,6 +272,8 @@ impl LlamaCppLib {
             llama_get_logits_ith: load_fn!(llama_lib, "llama_get_logits_ith"),
 
             llama_vocab_n_tokens: load_fn!(llama_lib, "llama_vocab_n_tokens"),
+
+            llama_kv_cache_clear: load_fn!(llama_lib, "llama_kv_cache_clear"),
 
             llama_tokenize: load_fn!(llama_lib, "llama_tokenize"),
             llama_token_to_piece: load_fn!(llama_lib, "llama_token_to_piece"),
