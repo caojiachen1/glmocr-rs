@@ -286,8 +286,9 @@ impl OcrBackend for GgufBackend {
         let vocab = self.vocab;
         let mtmd_ctx = self.mtmd_ctx;
 
-        // Clear KV cache for fresh inference
-        unsafe { (lib.llama_kv_cache_clear)(ctx); }
+        // Clear KV cache for fresh inference (seq_id=-1, p0=-1, p1=-1 removes all)
+        let mem = unsafe { (lib.llama_get_memory)(ctx) };
+        unsafe { (lib.llama_memory_seq_rm)(mem, -1, -1, -1); }
 
         // ── Load and encode image ──
         let stage = "Load and encode image";

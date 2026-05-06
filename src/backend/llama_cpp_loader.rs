@@ -117,10 +117,10 @@ pub struct LlamaCppLib {
     // ── Vocab ──
     pub llama_vocab_n_tokens: unsafe extern "C" fn(*const LlamaVocab) -> c_int,
 
-    // ── KV cache ──
-    pub llama_kv_cache_clear: unsafe extern "C" fn(*mut LlamaContext),
-
-    // ── Token ──
+    // ── Memory ──
+    pub llama_memory_clear: unsafe extern "C" fn(LlamaMemoryT, bool),
+    pub llama_memory_seq_rm:
+        unsafe extern "C" fn(LlamaMemoryT, LlamaSeqId, LlamaPos, LlamaPos) -> bool,
     pub llama_tokenize: unsafe extern "C" fn(
         *const LlamaVocab, *const c_char, c_int,
         *mut LlamaToken, c_int, bool, bool,
@@ -141,9 +141,6 @@ pub struct LlamaCppLib {
         unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaContext, c_int) -> LlamaToken,
     pub llama_sampler_accept: unsafe extern "C" fn(*mut LlamaSampler, LlamaToken),
     pub llama_sampler_free: unsafe extern "C" fn(*mut LlamaSampler),
-
-    // ── Memory ──
-    pub llama_memory_clear: unsafe extern "C" fn(LlamaMemoryT, bool),
 
     // ── mtmd ──
     pub mtmd_context_params_default: unsafe extern "C" fn() -> MtmdContextParams,
@@ -273,7 +270,7 @@ impl LlamaCppLib {
 
             llama_vocab_n_tokens: load_fn!(llama_lib, "llama_vocab_n_tokens"),
 
-            llama_kv_cache_clear: load_fn!(llama_lib, "llama_kv_cache_clear"),
+            llama_memory_seq_rm: load_fn!(llama_lib, "llama_memory_seq_rm"),
 
             llama_tokenize: load_fn!(llama_lib, "llama_tokenize"),
             llama_token_to_piece: load_fn!(llama_lib, "llama_token_to_piece"),
